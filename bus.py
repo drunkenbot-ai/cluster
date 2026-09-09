@@ -65,10 +65,15 @@ class ClusterStorageBus:
                     vram_gb REAL,
                     status TEXT DEFAULT 'IDLE',
                     current_job_id TEXT,
+                    command TEXT,
                     last_heartbeat REAL,
                     created_at REAL
                 );
             """)
+            try:
+                conn.execute("ALTER TABLE workers ADD COLUMN command TEXT;")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
@@ -170,6 +175,35 @@ class ClusterStorageBus:
                 data["status"] = "OFFLINE"
             results.append(data)
         return results
+
+    def set_worker_command(self, worker_id: str, command: Optional[str]) -> None:
+        """Send a cooperative command signal (e.g. 'STOP', 'RESTART') to a worker."""
+        with self._connect() as conn:
+            conn.execute("UPDATE workers SET command = ? WHERE worker_id = ?;", (command, worker_id))
+
+    def get_worker_command(self, worker_id: str) -> Optional[str]:
+        """Check for pending cooperative commands for this worker."""
+        with self._connect() as conn:
+            cursor = conn.execute("SELECT command FROM workers WHERE worker_id = ?;", (worker_id,))
+            row = cursor.fetchone()
+            return row["command"] if row and row["command"] else None
+
+    def delete_worker(self, worker_id: str) -> bool:
+        """Delete a worker record from the database."""
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
+            return cursor.rowcount > 0
+
+    def delete_offline_workers(self, stale_threshold_seconds: float = 60.0) -> int:
+        """Delete all stale/offline workers from the database."""
+        now = time.time()
+        cutoff = now - stale_threshold_seconds
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM workers WHERE status = 'OFFLINE' OR last_heartbeat < ?;",
+                (cutoff,),
+            )
+            return cursor.rowcount
 
     # -------------------------------------------------------------------------
     # Job Management & Scheduling

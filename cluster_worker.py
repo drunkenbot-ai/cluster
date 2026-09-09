@@ -21,6 +21,7 @@ import ctypes
 import json
 import os
 import platform
+import shutil
 import signal
 import socket
 import sqlite3
@@ -33,31 +34,103 @@ from typing import Any, Generator, Optional
 
 
 # =============================================================================
-# 1. Dependency Auto-Bootstrapping
+# 1. Hardware Detection & Dependency Auto-Bootstrapping
 # =============================================================================
 
-def ensure_dependencies() -> None:
-    """Ensure torch and numpy are installed; install via pip if missing."""
-    missing = []
+def detect_all_gpus() -> list[dict[str, Any]]:
+    """Detect all compute GPUs available on the host machine."""
+    gpus: list[dict[str, Any]] = []
+
+    # 1. Check PyTorch CUDA if available
     try:
-        import torch  # noqa: F401
-    except ImportError:
-        missing.append("torch")
+        import torch
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                gpus.append({
+                    "index": i,
+                    "device": f"cuda:{i}",
+                    "name": torch.cuda.get_device_name(i),
+                    "vram_gb": round(props.total_memory / (1024 ** 3), 2),
+                })
+            return gpus
+    except Exception:
+        pass
+
+    # 2. Check nvidia-smi command directly
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            for line in out.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 3:
+                    idx = int(parts[0])
+                    name = parts[1]
+                    vram_mb = float(parts[2])
+                    gpus.append({
+                        "index": idx,
+                        "device": f"cuda:{idx}",
+                        "name": name,
+                        "vram_gb": round(vram_mb / 1024.0, 2),
+                    })
+            if gpus:
+                return gpus
+        except Exception:
+            pass
+
+    # Fallback to CPU
+    return [{
+        "index": -1,
+        "device": "cpu",
+        "name": platform.processor() or "CPU",
+        "vram_gb": 0.0,
+    }]
+
+
+def ensure_dependencies() -> None:
+    """Ensure torch and numpy are installed with CUDA support if an NVIDIA GPU is present."""
+    missing = []
     try:
         import numpy  # noqa: F401
     except ImportError:
         missing.append("numpy")
 
-    if missing:
-        print(f"[ClusterWorker] Missing required packages: {missing}. Installing via pip...")
+    has_nvidia = bool(shutil.which("nvidia-smi"))
+    need_cuda_torch = False
+
+    try:
+        import torch
+        if has_nvidia and not torch.cuda.is_available():
+            need_cuda_torch = True
+    except ImportError:
+        missing.append("torch")
+        if has_nvidia:
+            need_cuda_torch = True
+
+    if missing or need_cuda_torch:
+        print(f"[ClusterWorker] Preparing environment (missing={missing}, need_cuda={need_cuda_torch})...")
         try:
-            cmd = [sys.executable, "-m", "pip", "install", *missing]
-            subprocess.check_call(cmd)
-            print("[ClusterWorker] Dependencies installed successfully.")
+            if need_cuda_torch:
+                print("[ClusterWorker] NVIDIA GPU detected. Installing official PyTorch CUDA 12.4 wheel...")
+                cmd = [
+                    sys.executable, "-m", "pip", "install",
+                    "torch==2.6.0+cu124", "torchvision==0.21.0+cu124", "torchaudio==2.6.0+cu124",
+                    "--index-url", "https://download.pytorch.org/whl/cu124",
+                ]
+                if "numpy" in missing:
+                    cmd.append("numpy")
+                subprocess.check_call(cmd)
+            elif missing:
+                cmd = [sys.executable, "-m", "pip", "install", *missing]
+                subprocess.check_call(cmd)
+            print("[ClusterWorker] Dependencies verified successfully.")
         except Exception as exc:
-            print(f"[ClusterWorker] Failed to install dependencies automatically: {exc}")
-            print(f"[ClusterWorker] Please run: pip install {' '.join(missing)}")
-            sys.exit(1)
+            print(f"[ClusterWorker] Note: automatic dependency installation failed: {exc}")
 
 
 ensure_dependencies()
@@ -70,10 +143,16 @@ from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
 
 # =============================================================================
-# 2. Singleton Process Management
+# 2. Per-Device Singleton Process Management
 # =============================================================================
 
-LOCK_FILE = Path(tempfile.gettempdir()) / "cluster_worker_process.pid"
+def get_device_tag(device: str) -> str:
+    """Normalize device string to a clean alphanumeric tag for filenames and worker IDs."""
+    return device.lower().replace(":", "_").replace("-", "_")
+
+
+def get_lock_file(device_tag: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"cluster_worker_{device_tag}.pid"
 
 
 def is_pid_running(pid: int) -> bool:
@@ -102,11 +181,12 @@ def is_pid_running(pid: int) -> bool:
             return False
 
 
-def get_running_worker_pid() -> Optional[int]:
-    """Retrieve the PID of currently running cluster worker if active."""
-    if LOCK_FILE.exists():
+def get_running_worker_pid(device_tag: str = "default") -> Optional[int]:
+    """Retrieve the PID of currently running cluster worker for a specific device."""
+    lock_path = get_lock_file(device_tag)
+    if lock_path.exists():
         try:
-            pid = int(LOCK_FILE.read_text().strip())
+            pid = int(lock_path.read_text().strip())
             if is_pid_running(pid):
                 return pid
         except (ValueError, OSError):
@@ -114,69 +194,90 @@ def get_running_worker_pid() -> Optional[int]:
     return None
 
 
-def acquire_singleton_lock() -> bool:
-    """Ensure only one cluster worker process runs per machine."""
-    if LOCK_FILE.exists():
+def get_all_running_worker_pids() -> dict[str, int]:
+    """Find all running cluster worker PIDs across all devices on this host."""
+    res = {}
+    temp_dir = Path(tempfile.gettempdir())
+    for p in temp_dir.glob("cluster_worker_*.pid"):
         try:
-            old_pid = int(LOCK_FILE.read_text().strip())
-            if old_pid != os.getpid() and is_pid_running(old_pid):
-                print(f"[ClusterWorker] Another worker process is already running on this machine (PID: {old_pid}). Exiting.")
+            tag = p.stem.replace("cluster_worker_", "")
+            pid = int(p.read_text().strip())
+            if is_pid_running(pid):
+                res[tag] = pid
+            else:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return res
+
+
+def acquire_singleton_lock(device_tag: str = "default") -> bool:
+    """Ensure only one cluster worker process runs per device on this host."""
+    lock_path = get_lock_file(device_tag)
+    if lock_path.exists():
+        try:
+            old_pid = int(lock_path.read_text().strip())
+            if is_pid_running(old_pid):
+                print(f"[ClusterWorker] A worker is already running for device '{device_tag}' (PID: {old_pid}). Exiting.")
                 return False
         except (ValueError, OSError):
             pass
 
     try:
-        LOCK_FILE.write_text(str(os.getpid()))
-        atexit.register(release_singleton_lock)
+        lock_path.write_text(str(os.getpid()))
+        atexit.register(lambda: release_singleton_lock(device_tag))
         return True
     except Exception as exc:
         print(f"[ClusterWorker] Warning: could not write lockfile: {exc}")
         return True
 
 
-def release_singleton_lock() -> None:
-    """Release the process lock file on exit."""
+def release_singleton_lock(device_tag: str = "default") -> None:
+    """Release the device process lock file on exit."""
     try:
-        if LOCK_FILE.exists():
-            old_pid = int(LOCK_FILE.read_text().strip())
+        lock_path = get_lock_file(device_tag)
+        if lock_path.exists():
+            old_pid = int(lock_path.read_text().strip())
             if old_pid == os.getpid():
-                LOCK_FILE.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
     except Exception:
         pass
 
 
-def stop_running_worker() -> int:
-    """Terminate the active cluster worker process identified by the singleton lock."""
-    pid = get_running_worker_pid()
-    if not pid:
-        print("[ClusterWorker] No active cluster worker process is currently running on this machine.")
-        if LOCK_FILE.exists():
-            LOCK_FILE.unlink(missing_ok=True)
+def stop_running_worker(device_tag: Optional[str] = None) -> int:
+    """Terminate running worker process(es) on this machine."""
+    if device_tag:
+        pid = get_running_worker_pid(device_tag)
+        pids = {device_tag: pid} if pid else {}
+    else:
+        pids = get_all_running_worker_pids()
+
+    if not pids:
+        print("[ClusterWorker] No active cluster worker process found running on this machine.")
         return 0
 
-    print(f"[ClusterWorker] Stopping running worker process (PID: {pid})...")
-    if sys.platform == "win32":
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=False, capture_output=True)
-        except Exception as exc:
-            print(f"[ClusterWorker] Error invoking taskkill: {exc}")
-    else:
-        try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(0.5)
-            if is_pid_running(pid):
-                os.kill(pid, signal.SIGKILL)
-        except Exception as exc:
-            print(f"[ClusterWorker] Error sending termination signal: {exc}")
+    for tag, pid in pids.items():
+        print(f"[ClusterWorker] Stopping worker for device '{tag}' (PID: {pid})...")
+        if sys.platform == "win32":
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=False, capture_output=True)
+            except Exception as exc:
+                print(f"[ClusterWorker] Error invoking taskkill: {exc}")
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                if is_pid_running(pid):
+                    os.kill(pid, signal.SIGKILL)
+            except Exception as exc:
+                print(f"[ClusterWorker] Error sending termination signal: {exc}")
 
-    time.sleep(0.5)
-    if not is_pid_running(pid):
-        print(f"[ClusterWorker] Successfully stopped worker process (PID: {pid}).")
-        LOCK_FILE.unlink(missing_ok=True)
-        return 0
-    else:
-        print(f"[ClusterWorker] Failed to terminate worker process (PID: {pid}).")
-        return 1
+        time.sleep(0.3)
+        lock_path = get_lock_file(tag)
+        lock_path.unlink(missing_ok=True)
+        print(f"[ClusterWorker] Stopped worker process for '{tag}' (PID: {pid}).")
+
+    return 0
 
 
 def get_worker_executable() -> str:
@@ -189,7 +290,6 @@ def get_worker_executable() -> str:
         target_exe = app_data / "cluster_worker.exe"
         py_path = Path(sys.executable)
         if not target_exe.exists() or target_exe.stat().st_size != py_path.stat().st_size:
-            import shutil
             shutil.copyfile(py_path, target_exe)
         return str(target_exe)
     except Exception:
@@ -236,10 +336,15 @@ class StandaloneStorageBus:
                     vram_gb REAL,
                     status TEXT DEFAULT 'IDLE',
                     current_job_id TEXT,
+                    command TEXT,
                     last_heartbeat REAL,
                     created_at REAL
                 );
             """)
+            try:
+                conn.execute("ALTER TABLE workers ADD COLUMN command TEXT;")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
@@ -292,6 +397,31 @@ class StandaloneStorageBus:
                 """, (now, status, current_job_id, worker_id))
             else:
                 conn.execute("UPDATE workers SET last_heartbeat = ? WHERE worker_id = ?;", (now, worker_id))
+
+    def set_worker_command(self, worker_id: str, command: Optional[str]) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE workers SET command = ? WHERE worker_id = ?;", (command, worker_id))
+
+    def get_worker_command(self, worker_id: str) -> Optional[str]:
+        with self._connect() as conn:
+            cursor = conn.execute("SELECT command FROM workers WHERE worker_id = ?;", (worker_id,))
+            row = cursor.fetchone()
+            return row["command"] if row and row["command"] else None
+
+    def delete_worker(self, worker_id: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
+            return cursor.rowcount > 0
+
+    def delete_offline_workers(self, stale_threshold_seconds: float = 60.0) -> int:
+        now = time.time()
+        cutoff = now - stale_threshold_seconds
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM workers WHERE status = 'OFFLINE' OR last_heartbeat < ?;",
+                (cutoff,),
+            )
+            return cursor.rowcount
 
     def get_active_job(self) -> Optional[dict[str, Any]]:
         with self._connect() as conn:
@@ -446,16 +576,24 @@ class StandaloneWorker:
     def __init__(self, shared_dir: Path | str, worker_id: Optional[str] = None, device: Optional[str] = None) -> None:
         self.bus = StandaloneStorageBus(shared_dir)
         self.hostname = socket.gethostname()
-        self.worker_id = worker_id or f"{self.hostname}_{os.getpid()}"
 
+        # Hardware & device resolution
+        all_gpus = detect_all_gpus()
         if device:
             self.device_str = device
-        elif torch.cuda.is_available():
-            self.device_str = "cuda:0"
+        elif all_gpus and all_gpus[0]["device"] != "cpu":
+            self.device_str = all_gpus[0]["device"]
         else:
             self.device_str = "cpu"
 
-        if self.device_str.startswith("cuda") and torch.cuda.is_available():
+        self.device_tag = get_device_tag(self.device_str)
+        self.worker_id = worker_id or f"{self.hostname}_{self.device_tag}"
+
+        matched = next((g for g in all_gpus if g["device"] == self.device_str), None)
+        if matched:
+            self.gpu_name = matched["name"]
+            self.vram_gb = matched["vram_gb"]
+        elif self.device_str.startswith("cuda") and torch.cuda.is_available():
             dev_idx = 0
             if ":" in self.device_str:
                 try:
@@ -476,10 +614,23 @@ class StandaloneWorker:
         print(f"[ClusterWorker] Node: {self.worker_id}")
         print(f"[ClusterWorker] Host: {self.hostname} | Device: {self.device_str} ({self.gpu_name}, {self.vram_gb} GB VRAM)")
         print(f"[ClusterWorker] Central Storage: {self.bus.shared_dir.resolve()}")
-        print(f"[ClusterWorker] Running as process PID: {os.getpid()} (Visible in Task Manager)")
+        print(f"[ClusterWorker] Running as process PID: {os.getpid()} (Device Tag: {self.device_tag})")
         print("[ClusterWorker] Waiting for cluster jobs...")
 
         while True:
+            cmd = self.bus.get_worker_command(self.worker_id)
+            if cmd == "STOP":
+                print(f"[ClusterWorker] Received STOP command for {self.worker_id}. Shutting down...")
+                self.bus.set_worker_command(self.worker_id, None)
+                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                release_singleton_lock(self.device_tag)
+                sys.exit(0)
+            elif cmd == "RESTART":
+                print(f"[ClusterWorker] Received RESTART command for {self.worker_id}. Resetting...")
+                self.bus.set_worker_command(self.worker_id, None)
+                self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+                time.sleep(1.0)
+
             self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
             active_job = self.bus.get_active_job()
 
@@ -520,6 +671,14 @@ class StandaloneWorker:
                 print(f"[ClusterWorker] Job {job_id} stopped.")
                 break
 
+            cmd = self.bus.get_worker_command(self.worker_id)
+            if cmd == "STOP":
+                print(f"[ClusterWorker] Received STOP command during job {job_id}.")
+                self.bus.set_worker_command(self.worker_id, None)
+                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                release_singleton_lock(self.device_tag)
+                sys.exit(0)
+
             # Handle cooperative pause
             while self.bus.is_paused(job_id):
                 self.bus.heartbeat(self.worker_id, status="PAUSED", current_job_id=job_id)
@@ -536,18 +695,19 @@ class StandaloneWorker:
                     self.bus.heartbeat(self.worker_id, status="SYNC_WAIT", current_job_id=job_id)
                     time.sleep(poll_interval)
 
-                global_weights = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
-                model.load_state_dict(global_weights)
+                global_state = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
+                model.load_state_dict(global_state)
+                print(f"[ClusterWorker] Loaded round {cur_round - 1} global weights into {self.device_str}.")
 
-            # Local training for K steps
-            self.bus.heartbeat(self.worker_id, status="TRAINING", current_job_id=job_id)
+            # Local SGD training steps
+            print(f"[ClusterWorker] Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str})...")
             model.train()
-            print(f"[ClusterWorker] Starting round {cur_round}: executing {sync_steps} local SGD steps...")
-            step_losses = []
+            self.bus.heartbeat(self.worker_id, status="TRAINING", current_job_id=job_id)
 
-            for s in range(sync_steps):
+            step_losses = []
+            for _ in range(sync_steps):
                 if self.bus.is_stopped(job_id):
-                    break
+                    return
                 try:
                     batch = next(dataloader_iter)
                 except StopIteration:
@@ -598,25 +758,29 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Standalone Cluster Worker Daemon for Local SGD")
     parser.add_argument("--shared-dir", default=None, help="Path to central shared storage directory (or set LLM_SHARED_DIR)")
     parser.add_argument("--worker-id", default=None, help="Explicit worker node identifier")
-    parser.add_argument("--device", default=None, help="Compute device (e.g. 'cuda:0', 'cpu')")
+    parser.add_argument("--device", default=None, help="Compute device (e.g. 'cuda:0', 'cuda:1', 'cpu')")
+    parser.add_argument("--all-gpus", action="store_true", help="Launch a dedicated background worker process for each detected GPU")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds")
-    parser.add_argument("--stop", action="store_true", help="Stop any active background worker process on this machine")
-    parser.add_argument("--status", action="store_true", help="Check status of background worker on this machine")
+    parser.add_argument("--stop", action="store_true", help="Stop active background worker process(es) on this machine")
+    parser.add_argument("--status", action="store_true", help="Check status of background worker(s) on this machine")
     args = parser.parse_args()
 
+    shared_dir = args.shared_dir or os.environ.get("LLM_SHARED_DIR")
+
     if args.stop:
-        return stop_running_worker()
+        device_tag = get_device_tag(args.device) if args.device else None
+        return stop_running_worker(device_tag)
 
     if args.status:
-        active_pid = get_running_worker_pid()
-        if active_pid:
-            print(f"[ClusterWorker] Worker is RUNNING on this machine (PID: {active_pid}).")
-            return 0
+        pids = get_all_running_worker_pids()
+        if pids:
+            print(f"[ClusterWorker] Active workers on this host ({len(pids)}):")
+            for dev_tag, pid in pids.items():
+                print(f"  - Device [{dev_tag}]: PID {pid}")
         else:
-            print("[ClusterWorker] No active worker process is currently running on this machine.")
-            return 0
+            print("[ClusterWorker] No active worker processes running on this host.")
+        return 0
 
-    shared_dir = args.shared_dir or os.environ.get("LLM_SHARED_DIR")
     if not shared_dir:
         print("[ClusterWorker] ERROR: Central shared directory not specified!")
         print("[ClusterWorker] Please either:")
@@ -624,19 +788,43 @@ def main() -> int:
         print("  2. Pass the argument: python cluster_worker.py --shared-dir Z:\\llm_cluster")
         return 1
 
-    # Enforce singleton
-    if not acquire_singleton_lock():
+    # Handle multi-GPU launch
+    if args.all_gpus:
+        all_gpus = detect_all_gpus()
+        devices = [g["device"] for g in all_gpus] if all_gpus else ["cpu"]
+        print(f"[ClusterWorker] Multi-GPU mode: spawning worker process for each device: {devices}")
+        worker_exe = get_worker_executable()
+        script_path = str(Path(__file__).resolve())
+        env = os.environ.copy()
+        if shared_dir:
+            env["LLM_SHARED_DIR"] = shared_dir
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        for dev in devices:
+            cmd = [worker_exe, script_path, "--device", dev, "--shared-dir", shared_dir]
+            proc = subprocess.Popen(cmd, env=env, creationflags=flags)
+            print(f"[ClusterWorker] Started worker for device '{dev}' (PID: {proc.pid})")
+        return 0
+
+    # Single device worker
+    resolved_device = args.device
+    if not resolved_device:
+        all_gpus = detect_all_gpus()
+        resolved_device = all_gpus[0]["device"] if (all_gpus and all_gpus[0]["device"] != "cpu") else "cpu"
+
+    device_tag = get_device_tag(resolved_device)
+
+    # Enforce per-device singleton
+    if not acquire_singleton_lock(device_tag):
         return 0
 
     # Set process console title on Windows
     if sys.platform == "win32":
         try:
-            worker_label = args.worker_id or socket.gethostname()
+            worker_label = args.worker_id or f"{socket.gethostname()}_{device_tag}"
             ctypes.windll.kernel32.SetConsoleTitleW(f"ClusterWorker [{worker_label}] - PID {os.getpid()}")
         except Exception:
             pass
 
-    # Graceful termination handler
     worker: Optional[StandaloneWorker] = None
 
     def _sig_handler(signum: int, frame: Any) -> None:
@@ -646,13 +834,13 @@ def main() -> int:
                 worker.bus.heartbeat(worker.worker_id, status="OFFLINE", current_job_id=None)
             except Exception:
                 pass
-        release_singleton_lock()
+        release_singleton_lock(device_tag)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    worker = StandaloneWorker(shared_dir=shared_dir, worker_id=args.worker_id, device=args.device)
+    worker = StandaloneWorker(shared_dir=shared_dir, worker_id=args.worker_id, device=resolved_device)
     try:
         worker.run(poll_interval=args.poll_interval)
     except KeyboardInterrupt:
