@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import ctypes
 import json
+import math
 import os
 import platform
 import shutil
@@ -114,23 +115,47 @@ def ensure_dependencies() -> None:
 
     if missing or need_cuda_torch:
         print(f"[ClusterWorker] Preparing environment (missing={missing}, need_cuda={need_cuda_torch})...")
-        try:
-            if need_cuda_torch:
-                print("[ClusterWorker] NVIDIA GPU detected. Installing official PyTorch CUDA 12.4 wheel...")
-                cmd = [
-                    sys.executable, "-m", "pip", "install",
-                    "torch==2.6.0+cu124", "torchvision==0.21.0+cu124", "torchaudio==2.6.0+cu124",
-                    "--index-url", "https://download.pytorch.org/whl/cu124",
-                ]
-                if "numpy" in missing:
-                    cmd.append("numpy")
-                subprocess.check_call(cmd)
-            elif missing:
-                cmd = [sys.executable, "-m", "pip", "install", *missing]
-                subprocess.check_call(cmd)
-            print("[ClusterWorker] Dependencies verified successfully.")
-        except Exception as exc:
-            print(f"[ClusterWorker] Note: automatic dependency installation failed: {exc}")
+
+        # 1. Check for offline wheels cache in shared directory
+        shared_dir_env = os.environ.get("LLM_SHARED_DIR", "")
+        shared_wheels = Path(shared_dir_env) / "wheels" if shared_dir_env else None
+        installed_offline = False
+
+        if shared_wheels and shared_wheels.is_dir():
+            whls = list(shared_wheels.glob("*.whl"))
+            if whls:
+                print(f"[ClusterWorker] Offline wheel cache detected with {len(whls)} wheel(s) at: {shared_wheels}")
+                try:
+                    cmd = [
+                        sys.executable, "-m", "pip", "install",
+                        "--no-index", f"--find-links={shared_wheels}",
+                        "torch", "numpy",
+                    ]
+                    subprocess.check_call(cmd)
+                    installed_offline = True
+                    print("[ClusterWorker] Offline dependencies installed successfully from shared storage.")
+                except Exception as exc:
+                    print(f"[ClusterWorker] Note: offline wheel install failed ({exc}), falling back to online install...")
+
+        # 2. Online install fallback if offline was not used or failed
+        if not installed_offline:
+            try:
+                if need_cuda_torch:
+                    print("[ClusterWorker] NVIDIA GPU detected. Installing official PyTorch CUDA 12.4 wheel...")
+                    cmd = [
+                        sys.executable, "-m", "pip", "install",
+                        "torch==2.6.0+cu124", "torchvision==0.21.0+cu124", "torchaudio==2.6.0+cu124",
+                        "--index-url", "https://download.pytorch.org/whl/cu124",
+                    ]
+                    if "numpy" in missing:
+                        cmd.append("numpy")
+                    subprocess.check_call(cmd)
+                elif missing:
+                    cmd = [sys.executable, "-m", "pip", "install", *missing]
+                    subprocess.check_call(cmd)
+                print("[ClusterWorker] Dependencies verified successfully.")
+            except Exception as exc:
+                print(f"[ClusterWorker] Note: automatic dependency installation failed: {exc}")
 
 
 ensure_dependencies()
@@ -526,46 +551,189 @@ class StandaloneTokenDataset(Dataset):
 
 
 # =============================================================================
-# 5. Model Architecture Factory
+# 5. Model Architecture Factory (MicroGPT Parity)
 # =============================================================================
 
+class StandaloneRotaryEmbedding(nn.Module):
+    def __init__(self, head_size: int, context_length: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2).float() / head_size))
+        positions = torch.arange(context_length, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        token_count = query.size(-2)
+        cos = self.cos[:, :, start_pos : start_pos + token_count, :]
+        sin = self.sin[:, :, start_pos : start_pos + token_count, :]
+        q_rot = (query * cos) + (self._rotate_half(query) * sin)
+        k_rot = (key * cos) + (self._rotate_half(key) * sin)
+        return q_rot, k_rot
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        first, second = x.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+
+class StandaloneRMSNorm(nn.Module):
+    def __init__(self, size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
+
+class StandaloneLayerNorm(nn.Module):
+    def __init__(self, size: int, bias: bool = False) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size))
+        self.bias = nn.Parameter(torch.zeros(size)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+def make_standalone_norm(norm_type: str, dim: int, bias: bool = False) -> nn.Module:
+    if norm_type == "rmsnorm":
+        return StandaloneRMSNorm(dim)
+    return StandaloneLayerNorm(dim, bias=bias)
+
+
+class StandaloneCausalSelfAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, kv_heads: int, context_length: int, dropout: float = 0.0, bias: bool = False, pos_enc: str = "rope") -> None:
+        super().__init__()
+        self.head_count = n_heads
+        self.kv_head_count = kv_heads or n_heads
+        self.embedding_size = d_model
+        self.head_size = d_model // n_heads
+        self.kv_embedding_size = self.kv_head_count * self.head_size
+        self.c_attn = nn.Linear(d_model, d_model + (2 * self.kv_embedding_size), bias=bias)
+        self.c_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.rotary = StandaloneRotaryEmbedding(self.head_size, context_length) if pos_enc == "rope" else None
+        self.register_buffer("mask", torch.tril(torch.ones(context_length, context_length, dtype=torch.bool)).view(1, 1, context_length, context_length))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split((self.embedding_size, self.kv_embedding_size, self.kv_embedding_size), dim=2)
+        q = q.view(b, t, self.head_count, self.head_size).transpose(1, 2)
+        k = k.view(b, t, self.kv_head_count, self.head_size).transpose(1, 2)
+        v = v.view(b, t, self.kv_head_count, self.head_size).transpose(1, 2)
+        if self.rotary is not None:
+            q, k = self.rotary(q, k)
+        if self.kv_head_count != self.head_count:
+            rep = self.head_count // self.kv_head_count
+            k = k[:, :, None, :, :].expand(b, self.kv_head_count, rep, t, self.head_size).reshape(b, self.head_count, t, self.head_size)
+            v = v[:, :, None, :, :].expand(b, self.kv_head_count, rep, t, self.head_size).reshape(b, self.head_count, t, self.head_size)
+
+        if hasattr(F, "scaled_dot_product_attention"):
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0)
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
+            att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = self.attn_dropout(att) @ v
+
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        return self.resid_dropout(self.c_proj(y))
+
+
+class StandaloneMLP(nn.Module):
+    def __init__(self, d_model: int, hidden_dim: int, mlp_type: str = "swiglu", dropout: float = 0.0, bias: bool = False) -> None:
+        super().__init__()
+        self.mlp_type = mlp_type
+        if mlp_type == "swiglu":
+            self.w1 = nn.Linear(d_model, hidden_dim, bias=bias)
+            self.w2 = nn.Linear(hidden_dim, d_model, bias=bias)
+            self.w3 = nn.Linear(d_model, hidden_dim, bias=bias)
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(d_model, hidden_dim, bias=bias),
+                nn.GELU(),
+                nn.Linear(hidden_dim, d_model, bias=bias),
+                nn.Dropout(dropout),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mlp_type == "swiglu":
+            return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        return self.net(x)
+
+
+class StandaloneBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, kv_heads: int, hidden_dim: int, context_length: int, norm_type: str = "rmsnorm", mlp_type: str = "swiglu", dropout: float = 0.0, bias: bool = False, pos_enc: str = "rope") -> None:
+        super().__init__()
+        self.ln_1 = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.attn = StandaloneCausalSelfAttention(d_model, n_heads, kv_heads, context_length, dropout, bias, pos_enc)
+        self.ln_2 = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.mlp = StandaloneMLP(d_model, hidden_dim, mlp_type, dropout, bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class StandaloneMicroGPT(nn.Module):
+    """Zero-dependency PyTorch implementation of MicroGPT, 100% state-dict compatible with engine."""
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        vocab_size = int(config.get("vocab_size", 1000))
+        d_model = int(config.get("embedding_size", 128))
+        context_length = int(config.get("context_length", 256))
+        n_heads = int(config.get("head_count", 4))
+        kv_heads = int(config.get("kv_head_count") or n_heads)
+        n_layers = int(config.get("layer_count", 2))
+        hidden_dim = int(config.get("intermediate_size") or (d_model * 4))
+        norm_type = str(config.get("norm_type", "rmsnorm"))
+        mlp_type = str(config.get("mlp_type", "swiglu"))
+        dropout = float(config.get("dropout", 0.0))
+        bias = bool(config.get("bias", False))
+        pos_enc = str(config.get("position_encoding", "rope"))
+
+        self.context_length = context_length
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(context_length, d_model) if pos_enc == "learned" else None
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.Sequential(*[
+            StandaloneBlock(d_model, n_heads, kv_heads, hidden_dim, context_length, norm_type, mlp_type, dropout, bias, pos_enc)
+            for _ in range(n_layers)
+        ])
+        self.ln_f = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.token_embedding.weight = self.lm_head.weight
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        b, t = idx.size()
+        x = self.token_embedding(idx)
+        if self.position_embedding is not None:
+            positions = torch.arange(0, t, dtype=torch.long, device=idx.device)
+            x = x + self.position_embedding(positions)
+        x = self.drop(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+
 def build_worker_model(model_config: dict[str, Any], device: str) -> nn.Module:
-    """Build model using engine if available, or lightweight PyTorch Transformer fallback."""
+    """Build model using engine if available, or standalone exact MicroGPT implementation."""
     try:
         from engine.config import ModelConfig
-        from engine.model_transformer import TransformerModel
+        from engine.model import MicroGPT
         valid_keys = ModelConfig.__dataclass_fields__.keys()
         filtered = {k: v for k, v in model_config.items() if k in valid_keys}
-        return TransformerModel(ModelConfig(**filtered)).to(device)
+        return MicroGPT(ModelConfig(**filtered)).to(device)
     except Exception:
-        vocab_size = int(model_config.get("vocab_size", 1000))
-        embed_dim = int(model_config.get("embedding_size", 128))
-        num_heads = int(model_config.get("head_count", 4))
-        num_layers = int(model_config.get("layer_count", 2))
-        dropout = float(model_config.get("dropout", 0.1))
-
-        class WorkerCausalTransformer(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.tok_embed = nn.Embedding(vocab_size, embed_dim)
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=embed_dim,
-                    nhead=num_heads,
-                    dim_feedforward=embed_dim * 4,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-                self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                b, s = x.shape
-                mask = torch.triu(torch.full((s, s), float("-inf"), device=x.device), diagonal=1)
-                h = self.tok_embed(x)
-                out = self.transformer(h, mask=mask, is_causal=True)
-                return self.lm_head(out)
-
-        return WorkerCausalTransformer().to(device)
+        return StandaloneMicroGPT(model_config).to(device)
 
 
 # =============================================================================
@@ -743,6 +911,11 @@ class StandaloneWorker:
                     return
                 self.bus.heartbeat(self.worker_id, status="SYNC_WAIT", current_job_id=job_id)
                 time.sleep(poll_interval)
+
+            # Load synchronized global model weights into local model for next round
+            global_weights = self.bus.load_global_weights(job_id, cur_round, device=self.device_str)
+            model.load_state_dict(global_weights)
+            print(f"[ClusterWorker] Successfully loaded averaged global weights for round {cur_round}.")
 
             cur_round += 1
 

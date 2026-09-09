@@ -68,13 +68,13 @@ def build_model_from_config(model_config: dict[str, Any], device: str) -> nn.Mod
     """
     try:
         from engine.config import ModelConfig
-        from engine.model_transformer import TransformerModel
+        from engine.model import MicroGPT
 
         # Filter config keys recognized by ModelConfig
         valid_keys = ModelConfig.__dataclass_fields__.keys()
         filtered = {k: v for k, v in model_config.items() if k in valid_keys}
         cfg = ModelConfig(**filtered)
-        model = TransformerModel(cfg)
+        model = MicroGPT(cfg)
         return model.to(device)
     except (ImportError, Exception):
         # Fallback minimal transformer language model
