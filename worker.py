@@ -1,0 +1,367 @@
+"""Distributed Cluster Worker Daemon for Local SGD Training.
+
+Runs as a lightweight headless service on worker compute nodes:
+1. Discovers local hardware (GPU, VRAM).
+2. Registers with the central storage bus and emits periodic heartbeats.
+3. Claims a data shard and executes K steps of local training.
+4. Atomically deposits weight checkpoints to central storage.
+5. Synchronizes from the coordinator's global averaged model.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import socket
+import threading
+import time
+from typing import Any, Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+
+from .bus import ClusterStorageBus
+from .sharding import ShardedTokenDataset
+
+
+def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str, float]:
+    """Detect available compute device, GPU model, and VRAM in GB.
+
+    Args:
+        device_preference: Optional explicit device string (e.g. 'cuda:0', 'cpu').
+
+    Returns:
+        (device_str, gpu_name, vram_gb)
+    """
+    if device_preference:
+        device_str = device_preference
+    elif torch.cuda.is_available():
+        device_str = "cuda:0"
+    else:
+        device_str = "cpu"
+
+    if device_str.startswith("cuda") and torch.cuda.is_available():
+        device_idx = 0
+        if ":" in device_str:
+            try:
+                device_idx = int(device_str.split(":")[1])
+            except ValueError:
+                device_idx = 0
+        gpu_name = torch.cuda.get_device_name(device_idx)
+        props = torch.cuda.get_device_properties(device_idx)
+        vram_gb = round(props.total_memory / (1024 ** 3), 2)
+    else:
+        gpu_name = platform.processor() or "CPU"
+        vram_gb = 0.0
+
+    return device_str, gpu_name, vram_gb
+
+
+def build_model_from_config(model_config: dict[str, Any], device: str) -> nn.Module:
+    """Instantiate a transformer model from configuration.
+
+    Attempts import from `engine.model_transformer.TransformerModel` first.
+    Falls back to a standard PyTorch TransformerLM if engine is not installed.
+    """
+    try:
+        from engine.config import ModelConfig
+        from engine.model_transformer import TransformerModel
+
+        # Filter config keys recognized by ModelConfig
+        valid_keys = ModelConfig.__dataclass_fields__.keys()
+        filtered = {k: v for k, v in model_config.items() if k in valid_keys}
+        cfg = ModelConfig(**filtered)
+        model = TransformerModel(cfg)
+        return model.to(device)
+    except (ImportError, Exception):
+        # Fallback minimal transformer language model
+        vocab_size = int(model_config.get("vocab_size", 1000))
+        embed_dim = int(model_config.get("embedding_size", 128))
+        num_heads = int(model_config.get("head_count", 4))
+        num_layers = int(model_config.get("layer_count", 2))
+        dropout = float(model_config.get("dropout", 0.1))
+
+        class FallbackLM(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tok_embed = nn.Embedding(vocab_size, embed_dim)
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=embed_dim,
+                    nhead=num_heads,
+                    dim_feedforward=embed_dim * 4,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+                self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                b, s = x.shape
+                # Causal mask
+                mask = torch.triu(torch.full((s, s), float("-inf"), device=x.device), diagonal=1)
+                h = self.tok_embed(x)
+                out = self.transformer(h, mask=mask, is_causal=True)
+                return self.lm_head(out)
+
+        return FallbackLM().to(device)
+
+
+class ClusterWorker:
+    """Worker daemon executing distributed Local SGD rounds on a worker node."""
+
+    def __init__(
+        self,
+        bus: ClusterStorageBus,
+        worker_id: Optional[str] = None,
+        device: Optional[str] = None,
+        heartbeat_interval: float = 5.0,
+    ) -> None:
+        """Initialize worker daemon.
+
+        Args:
+            bus: Shared storage bus instance.
+            worker_id: Unique worker node identifier (defaults to hostname-pid).
+            device: Compute device ('cuda:0', 'cpu', etc.).
+            heartbeat_interval: Heartbeat interval in seconds.
+        """
+        self.bus = bus
+        self.hostname = socket.gethostname()
+        self.worker_id = worker_id or f"{self.hostname}_{os.getpid()}"
+        self.device_str, self.gpu_name, self.vram_gb = get_hardware_info(device)
+        self.heartbeat_interval = heartbeat_interval
+        self._stop_event = threading.Event()
+        self._current_job_id: Optional[str] = None
+        self._current_status: str = "IDLE"
+
+        # Register worker in SQLite database
+        self.bus.register_worker(
+            worker_id=self.worker_id,
+            hostname=self.hostname,
+            gpu_name=self.gpu_name,
+            vram_gb=self.vram_gb,
+        )
+
+        # Start background heartbeat daemon thread
+        self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._hb_thread.start()
+
+    def _heartbeat_loop(self) -> None:
+        """Background thread updating heartbeat periodically."""
+        while not self._stop_event.is_set():
+            try:
+                self.bus.heartbeat(
+                    worker_id=self.worker_id,
+                    status=self._current_status,
+                    current_job_id=self._current_job_id,
+                )
+            except Exception:
+                pass
+            self._stop_event.wait(self.heartbeat_interval)
+
+    def stop(self) -> None:
+        """Signal worker to gracefully stop."""
+        self._stop_event.set()
+        if self._hb_thread.is_alive():
+            self._hb_thread.join(timeout=2.0)
+        try:
+            self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+        except Exception:
+            pass
+
+    def run_training_round(
+        self,
+        job_id: str,
+        round_num: int,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        dataloader: DataLoader,
+        dataloader_iter: Any,
+        steps_per_round: int,
+        log_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> tuple[float, Any]:
+        """Execute K steps of local SGD training for a single round.
+
+        Args:
+            job_id: Distributed job ID.
+            round_num: Current synchronization round.
+            model: PyTorch model module.
+            optimizer: Optimizer instance.
+            dataloader: Sharded token data loader.
+            dataloader_iter: Active DataLoader iterator.
+            steps_per_round: Local training steps before sync.
+            log_callback: Optional progress reporter.
+
+        Returns:
+            (average_loss, dataloader_iter)
+        """
+        model.train()
+        total_loss = 0.0
+        steps_done = 0
+
+        for step in range(steps_per_round):
+            if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                break
+
+            # Handle cooperative pause
+            while self.bus.is_paused(job_id) and not self._stop_event.is_set():
+                self._current_status = "PAUSED"
+                time.sleep(1.0)
+                if self.bus.is_stopped(job_id):
+                    break
+
+            self._current_status = "TRAINING"
+
+            # Fetch next batch (looping iterator if exhausted)
+            try:
+                batch = next(dataloader_iter)
+            except StopIteration:
+                dataloader_iter = iter(dataloader)
+                batch = next(dataloader_iter)
+
+            x, y = batch
+            x = x.to(self.device_str, non_blocking=True)
+            y = y.to(self.device_str, non_blocking=True)
+
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            optimizer.step()
+
+            loss_val = float(loss.item())
+            total_loss += loss_val
+            steps_done += 1
+
+            if log_callback:
+                log_callback({
+                    "job_id": job_id,
+                    "round": round_num,
+                    "step": step + 1,
+                    "steps_per_round": steps_per_round,
+                    "loss": loss_val,
+                })
+
+        avg_loss = (total_loss / steps_done) if steps_done > 0 else 0.0
+        return avg_loss, dataloader_iter
+
+    def execute_job(
+        self,
+        job: dict[str, Any],
+        poll_interval: float = 2.0,
+        log_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> bool:
+        """Execute a full distributed training job across rounds.
+
+        Args:
+            job: Job metadata dictionary from database.
+            poll_interval: Polling frequency during synchronization waits.
+            log_callback: Optional status and telemetry logger.
+
+        Returns:
+            True if completed successfully, False if aborted or stopped.
+        """
+        job_id = job["job_id"]
+        self._current_job_id = job_id
+        self._current_status = "PREPARING"
+
+        model_config = job.get("model_config", {})
+        training_config = job.get("training_config", {})
+        dataset_path = job.get("dataset_path", "")
+        max_rounds = int(job.get("max_rounds", 10))
+        sync_interval_steps = int(job.get("sync_interval_steps", 250))
+        batch_size = int(training_config.get("batch_size", 4))
+        lr = float(training_config.get("learning_rate", 3e-4))
+        context_length = int(model_config.get("context_length", 512))
+
+        # Claim data shard slot
+        shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
+
+        # Prepare dataset
+        if not os.path.exists(dataset_path):
+            raise FileNotFoundError(f"Dataset path not found on shared storage: {dataset_path}")
+
+        token_array = np.load(dataset_path, mmap_mode="r")
+        dataset = ShardedTokenDataset(
+            token_array=token_array,
+            context_length=context_length,
+            shard_index=shard_idx,
+            total_shards=total_shards,
+        )
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataloader_iter = iter(dataloader)
+
+        # Build model and optimizer
+        model = build_model_from_config(model_config, self.device_str)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+        current_round = int(job.get("current_round", 0))
+
+        while current_round < max_rounds and not self._stop_event.is_set():
+            if self.bus.is_stopped(job_id):
+                self._current_status = "STOPPED"
+                return False
+
+            # If round > 0, wait for and synchronize from previous global averaged model
+            if current_round > 0:
+                self._current_status = "SYNC_WAIT"
+                while not self.bus.is_global_weights_ready(job_id, current_round - 1):
+                    if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                        return False
+                    time.sleep(poll_interval)
+
+                global_state = self.bus.load_global_weights(
+                    job_id, current_round - 1, device=self.device_str
+                )
+                model.load_state_dict(global_state)
+
+            # Train locally for K steps
+            avg_loss, dataloader_iter = self.run_training_round(
+                job_id=job_id,
+                round_num=current_round,
+                model=model,
+                optimizer=optimizer,
+                dataloader=dataloader,
+                dataloader_iter=dataloader_iter,
+                steps_per_round=sync_interval_steps,
+                log_callback=log_callback,
+            )
+
+            # Atomically deposit local worker weights
+            self.bus.save_worker_weights(
+                job_id=job_id,
+                round_num=current_round,
+                worker_id=self.worker_id,
+                state_dict={k: v.cpu() for k, v in model.state_dict().items()},
+            )
+
+            self._current_status = "SYNC_WAIT"
+
+            # Wait for coordinator to publish global model for this round
+            while not self.bus.is_global_weights_ready(job_id, current_round):
+                if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                    return False
+                time.sleep(poll_interval)
+
+            current_round += 1
+
+        self._current_status = "COMPLETED"
+        self._current_job_id = None
+        return True
+
+    def run_daemon(self, poll_interval: float = 3.0) -> None:
+        """Run persistent background loop polling for jobs and executing them."""
+        while not self._stop_event.is_set():
+            self._current_status = "IDLE"
+            self._current_job_id = None
+
+            try:
+                active_job = self.bus.get_active_job()
+                if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
+                    self.execute_job(active_job, poll_interval=poll_interval)
+            except Exception as exc:
+                print(f"[Worker {self.worker_id}] Error in worker daemon: {exc}")
+
+            self._stop_event.wait(poll_interval)
