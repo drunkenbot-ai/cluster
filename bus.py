@@ -66,14 +66,27 @@ class ClusterStorageBus:
                     status TEXT DEFAULT 'IDLE',
                     current_job_id TEXT,
                     command TEXT,
+                    cpu_percent REAL DEFAULT 0.0,
+                    ram_used_gb REAL DEFAULT 0.0,
+                    ram_total_gb REAL DEFAULT 0.0,
+                    vram_used_gb REAL DEFAULT 0.0,
+                    metrics_json TEXT,
                     last_heartbeat REAL,
                     created_at REAL
                 );
             """)
-            try:
-                conn.execute("ALTER TABLE workers ADD COLUMN command TEXT;")
-            except Exception:
-                pass
+            for col_def in [
+                ("command", "TEXT"),
+                ("cpu_percent", "REAL DEFAULT 0.0"),
+                ("ram_used_gb", "REAL DEFAULT 0.0"),
+                ("ram_total_gb", "REAL DEFAULT 0.0"),
+                ("vram_used_gb", "REAL DEFAULT 0.0"),
+                ("metrics_json", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE workers ADD COLUMN {col_def[0]} {col_def[1]};")
+                except Exception:
+                    pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
@@ -147,16 +160,45 @@ class ClusterStorageBus:
         worker_id: str,
         status: Optional[str] = None,
         current_job_id: Optional[str] = None,
+        metrics: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Update a worker's last heartbeat timestamp and status."""
+        """Update a worker's last heartbeat timestamp, status, and resource usage metrics."""
         now = time.time()
         with self._connect() as conn:
-            if status is not None:
+            cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
+            ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
+            ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
+            vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
+            metrics_str = json.dumps(metrics) if metrics else None
+
+            if status is not None and metrics is not None:
+                conn.execute("""
+                    UPDATE workers
+                    SET last_heartbeat = ?, status = ?, current_job_id = ?,
+                        cpu_percent = COALESCE(?, cpu_percent),
+                        ram_used_gb = COALESCE(?, ram_used_gb),
+                        ram_total_gb = COALESCE(?, ram_total_gb),
+                        vram_used_gb = COALESCE(?, vram_used_gb),
+                        metrics_json = COALESCE(?, metrics_json)
+                    WHERE worker_id = ?;
+                """, (now, status, current_job_id, cpu_pct, ram_used, ram_tot, vram_used, metrics_str, worker_id))
+            elif status is not None:
                 conn.execute("""
                     UPDATE workers
                     SET last_heartbeat = ?, status = ?, current_job_id = ?
                     WHERE worker_id = ?;
                 """, (now, status, current_job_id, worker_id))
+            elif metrics is not None:
+                conn.execute("""
+                    UPDATE workers
+                    SET last_heartbeat = ?,
+                        cpu_percent = COALESCE(?, cpu_percent),
+                        ram_used_gb = COALESCE(?, ram_used_gb),
+                        ram_total_gb = COALESCE(?, ram_total_gb),
+                        vram_used_gb = COALESCE(?, vram_used_gb),
+                        metrics_json = COALESCE(?, metrics_json)
+                    WHERE worker_id = ?;
+                """, (now, cpu_pct, ram_used, ram_tot, vram_used, metrics_str, worker_id))
             else:
                 conn.execute("""
                     UPDATE workers
@@ -595,3 +637,56 @@ class ClusterStorageBus:
         """Load the averaged global weights for a round."""
         weight_path = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / "global_model.pt"
         return torch.load(weight_path, map_location=device)
+
+    # -------------------------------------------------------------------------
+    # Durable Checkpoints Storage
+    # -------------------------------------------------------------------------
+
+    def get_checkpoints_dir(self, job_id: str) -> Path:
+        """Return the checkpoints directory on central shared storage for a job."""
+        ckpt_dir = self.jobs_dir / job_id / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        return ckpt_dir
+
+    def save_checkpoint(
+        self,
+        job_id: str,
+        step: int,
+        state_dict: dict[str, torch.Tensor],
+        is_final: bool = False,
+    ) -> Path:
+        """Save a durable checkpoint on central shared storage."""
+        ckpt_dir = self.get_checkpoints_dir(job_id)
+        target = ckpt_dir / f"checkpoint_step_{step:06d}.pt"
+        tmp_target = ckpt_dir / f"checkpoint_step_{step:06d}.pt.tmp"
+        torch.save(state_dict, tmp_target)
+        tmp_target.replace(target)
+
+        # Update latest_checkpoint.pt
+        latest_target = ckpt_dir / "latest_checkpoint.pt"
+        latest_tmp = ckpt_dir / "latest_checkpoint.pt.tmp"
+        torch.save(state_dict, latest_tmp)
+        latest_tmp.replace(latest_target)
+
+        if is_final:
+            final_target = ckpt_dir / "final_model.pt"
+            final_tmp = ckpt_dir / "final_model.pt.tmp"
+            torch.save(state_dict, final_tmp)
+            final_tmp.replace(final_target)
+
+        return target
+
+    def load_latest_checkpoint(
+        self,
+        job_id: str,
+        device: str = "cpu",
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Load the latest checkpoint from central shared storage if available."""
+        ckpt_dir = self.get_checkpoints_dir(job_id)
+        latest = ckpt_dir / "latest_checkpoint.pt"
+        if latest.exists():
+            return torch.load(latest, map_location=device)
+        final = ckpt_dir / "final_model.pt"
+        if final.exists():
+            return torch.load(final, map_location=device)
+        return None

@@ -362,14 +362,27 @@ class StandaloneStorageBus:
                     status TEXT DEFAULT 'IDLE',
                     current_job_id TEXT,
                     command TEXT,
+                    cpu_percent REAL DEFAULT 0.0,
+                    ram_used_gb REAL DEFAULT 0.0,
+                    ram_total_gb REAL DEFAULT 0.0,
+                    vram_used_gb REAL DEFAULT 0.0,
+                    metrics_json TEXT,
                     last_heartbeat REAL,
                     created_at REAL
                 );
             """)
-            try:
-                conn.execute("ALTER TABLE workers ADD COLUMN command TEXT;")
-            except Exception:
-                pass
+            for col_def in [
+                ("command", "TEXT"),
+                ("cpu_percent", "REAL DEFAULT 0.0"),
+                ("ram_used_gb", "REAL DEFAULT 0.0"),
+                ("ram_total_gb", "REAL DEFAULT 0.0"),
+                ("vram_used_gb", "REAL DEFAULT 0.0"),
+                ("metrics_json", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE workers ADD COLUMN {col_def[0]} {col_def[1]};")
+                except Exception:
+                    pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     job_id TEXT PRIMARY KEY,
@@ -412,14 +425,48 @@ class StandaloneStorageBus:
                     last_heartbeat = excluded.last_heartbeat;
             """, (worker_id, hostname, gpu_name, vram_gb, now, now))
 
-    def heartbeat(self, worker_id: str, status: Optional[str] = None, current_job_id: Optional[str] = None) -> None:
+    def heartbeat(
+        self,
+        worker_id: str,
+        status: Optional[str] = None,
+        current_job_id: Optional[str] = None,
+        metrics: Optional[dict[str, Any]] = None,
+    ) -> None:
         now = time.time()
         with self._connect() as conn:
-            if status is not None:
+            cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
+            ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
+            ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
+            vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
+            metrics_str = json.dumps(metrics) if metrics else None
+
+            if status is not None and metrics is not None:
+                conn.execute("""
+                    UPDATE workers
+                    SET last_heartbeat = ?, status = ?, current_job_id = ?,
+                        cpu_percent = COALESCE(?, cpu_percent),
+                        ram_used_gb = COALESCE(?, ram_used_gb),
+                        ram_total_gb = COALESCE(?, ram_total_gb),
+                        vram_used_gb = COALESCE(?, vram_used_gb),
+                        metrics_json = COALESCE(?, metrics_json)
+                    WHERE worker_id = ?;
+                """, (now, status, current_job_id, cpu_pct, ram_used, ram_tot, vram_used, metrics_str, worker_id))
+            elif status is not None:
                 conn.execute("""
                     UPDATE workers SET last_heartbeat = ?, status = ?, current_job_id = ?
                     WHERE worker_id = ?;
                 """, (now, status, current_job_id, worker_id))
+            elif metrics is not None:
+                conn.execute("""
+                    UPDATE workers
+                    SET last_heartbeat = ?,
+                        cpu_percent = COALESCE(?, cpu_percent),
+                        ram_used_gb = COALESCE(?, ram_used_gb),
+                        ram_total_gb = COALESCE(?, ram_total_gb),
+                        vram_used_gb = COALESCE(?, vram_used_gb),
+                        metrics_json = COALESCE(?, metrics_json)
+                    WHERE worker_id = ?;
+                """, (now, cpu_pct, ram_used, ram_tot, vram_used, metrics_str, worker_id))
             else:
                 conn.execute("UPDATE workers SET last_heartbeat = ? WHERE worker_id = ?;", (now, worker_id))
 
@@ -564,6 +611,47 @@ class StandaloneStorageBus:
     def load_global_weights(self, job_id: str, round_num: int, device: str = "cpu") -> dict[str, torch.Tensor]:
         weight_path = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / "global_model.pt"
         return torch.load(weight_path, map_location=device)
+
+    def get_checkpoints_dir(self, job_id: str) -> Path:
+        ckpt_dir = self.jobs_dir / job_id / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        return ckpt_dir
+
+    def save_checkpoint(
+        self,
+        job_id: str,
+        step: int,
+        state_dict: dict[str, torch.Tensor],
+        is_final: bool = False,
+    ) -> Path:
+        ckpt_dir = self.get_checkpoints_dir(job_id)
+        target = ckpt_dir / f"checkpoint_step_{step:06d}.pt"
+        tmp_target = ckpt_dir / f"checkpoint_step_{step:06d}.pt.tmp"
+        torch.save(state_dict, tmp_target)
+        tmp_target.replace(target)
+
+        latest_target = ckpt_dir / "latest_checkpoint.pt"
+        latest_tmp = ckpt_dir / "latest_checkpoint.pt.tmp"
+        torch.save(state_dict, latest_tmp)
+        latest_tmp.replace(latest_target)
+
+        if is_final:
+            final_target = ckpt_dir / "final_model.pt"
+            final_tmp = ckpt_dir / "final_model.pt.tmp"
+            torch.save(state_dict, final_tmp)
+            final_tmp.replace(final_target)
+
+        return target
+
+    def load_latest_checkpoint(self, job_id: str, device: str = "cpu") -> Optional[dict[str, torch.Tensor]]:
+        ckpt_dir = self.get_checkpoints_dir(job_id)
+        latest = ckpt_dir / "latest_checkpoint.pt"
+        if latest.exists():
+            return torch.load(latest, map_location=device)
+        final = ckpt_dir / "final_model.pt"
+        if final.exists():
+            return torch.load(final, map_location=device)
+        return None
 
 
 # =============================================================================
@@ -792,6 +880,69 @@ def build_worker_model(model_config: dict[str, Any], device: str) -> nn.Module:
         return StandaloneMicroGPT(model_config).to(device)
 
 
+def collect_system_metrics(device_str: str = "cpu", total_vram_gb: float = 0.0) -> dict[str, Any]:
+    """Collect current real-time CPU, RAM, and GPU VRAM usage."""
+    metrics: dict[str, Any] = {
+        "cpu_percent": 0.0,
+        "ram_used_gb": 0.0,
+        "ram_total_gb": 0.0,
+        "vram_used_gb": 0.0,
+        "vram_total_gb": float(total_vram_gb or 0.0),
+    }
+
+    # 1. RAM & CPU
+    try:
+        import psutil
+        metrics["cpu_percent"] = round(float(psutil.cpu_percent(interval=None)), 1)
+        vm = psutil.virtual_memory()
+        metrics["ram_used_gb"] = round(float(vm.used) / (1024 ** 3), 1)
+        metrics["ram_total_gb"] = round(float(vm.total) / (1024 ** 3), 1)
+    except Exception:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                tot = float(stat.ullTotalPhys) / (1024 ** 3)
+                avail = float(stat.ullAvailPhys) / (1024 ** 3)
+                metrics["ram_total_gb"] = round(tot, 1)
+                metrics["ram_used_gb"] = round(tot - avail, 1)
+                metrics["cpu_percent"] = float(stat.dwMemoryLoad)
+            except Exception:
+                pass
+
+    # 2. VRAM
+    try:
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            dev_idx = 0
+            if ":" in device_str:
+                try:
+                    dev_idx = int(device_str.split(":")[1])
+                except ValueError:
+                    dev_idx = 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+            used_bytes = max(total_bytes - free_bytes, 0)
+            metrics["vram_used_gb"] = round(float(used_bytes) / (1024 ** 3), 2)
+            metrics["vram_total_gb"] = round(float(total_bytes) / (1024 ** 3), 2)
+    except Exception:
+        pass
+
+    return metrics
+
+
 # =============================================================================
 # 6. Worker Daemon Engine
 # =============================================================================
@@ -833,6 +984,10 @@ class StandaloneWorker:
 
         self.bus.register_worker(self.worker_id, self.hostname, self.gpu_name, self.vram_gb)
 
+    def _heartbeat(self, status: Optional[str] = None, current_job_id: Optional[str] = None) -> None:
+        metrics = collect_system_metrics(self.device_str, self.vram_gb)
+        self.bus.heartbeat(self.worker_id, status=status, current_job_id=current_job_id, metrics=metrics)
+
     def run(self, poll_interval: float = 3.0) -> None:
         """Main worker loop: registers heartbeat, claims jobs, and trains across rounds."""
         print(f"[ClusterWorker] Node: {self.worker_id}")
@@ -846,16 +1001,16 @@ class StandaloneWorker:
             if cmd == "STOP":
                 print(f"[ClusterWorker] Received STOP command for {self.worker_id}. Shutting down...")
                 self.bus.set_worker_command(self.worker_id, None)
-                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                self._heartbeat(status="OFFLINE", current_job_id=None)
                 release_singleton_lock(self.device_tag)
                 sys.exit(0)
             elif cmd == "RESTART":
                 print(f"[ClusterWorker] Received RESTART command for {self.worker_id}. Resetting...")
                 self.bus.set_worker_command(self.worker_id, None)
-                self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+                self._heartbeat(status="IDLE", current_job_id=None)
                 time.sleep(1.0)
 
-            self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+            self._heartbeat(status="IDLE", current_job_id=None)
             active_job = self.bus.get_active_job()
 
             if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
@@ -899,13 +1054,13 @@ class StandaloneWorker:
             if cmd == "STOP":
                 print(f"[ClusterWorker] Received STOP command during job {job_id}.")
                 self.bus.set_worker_command(self.worker_id, None)
-                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                self._heartbeat(status="OFFLINE", current_job_id=None)
                 release_singleton_lock(self.device_tag)
                 sys.exit(0)
 
             # Handle cooperative pause
             while self.bus.is_paused(job_id):
-                self.bus.heartbeat(self.worker_id, status="PAUSED", current_job_id=job_id)
+                self._heartbeat(status="PAUSED", current_job_id=job_id)
                 time.sleep(1.0)
                 if self.bus.is_stopped(job_id):
                     break
@@ -925,7 +1080,7 @@ class StandaloneWorker:
                 while not self.bus.is_global_weights_ready(job_id, cur_round - 1):
                     if self.bus.is_stopped(job_id):
                         return
-                    self.bus.heartbeat(self.worker_id, status="SYNC_WAIT", current_job_id=job_id)
+                    self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
                     time.sleep(poll_interval)
 
                 global_state = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
@@ -935,7 +1090,7 @@ class StandaloneWorker:
             # Local SGD training steps
             print(f"[ClusterWorker] Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str})...")
             model.train()
-            self.bus.heartbeat(self.worker_id, status="TRAINING", current_job_id=job_id)
+            self._heartbeat(status="TRAINING", current_job_id=job_id)
 
             start_time = time.time()
             tokens_processed = 0
@@ -995,7 +1150,7 @@ class StandaloneWorker:
             while not self.bus.is_global_weights_ready(job_id, cur_round):
                 if self.bus.is_stopped(job_id):
                     return
-                self.bus.heartbeat(self.worker_id, status="SYNC_WAIT", current_job_id=job_id)
+                self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
                 time.sleep(poll_interval)
 
             # Load synchronized global model weights into local model for next round
@@ -1006,7 +1161,7 @@ class StandaloneWorker:
             cur_round += 1
 
         print(f"[ClusterWorker] Job {job_id} finished. Returning to IDLE.")
-        self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+        self._heartbeat(status="IDLE", current_job_id=None)
 
 
 # =============================================================================

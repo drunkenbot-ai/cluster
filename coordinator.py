@@ -171,6 +171,10 @@ class ClusterCoordinator:
         max_rounds = int(job.get("max_rounds") or 10)
         effective_step = (round_num + 1) * sync_interval
 
+        # Save durable checkpoint to shared storage (checkpoints/checkpoint_step_XXXXXX.pt & latest_checkpoint.pt)
+        is_final_round = (round_num + 1 >= max_rounds)
+        self.bus.save_checkpoint(self.job_id, effective_step, global_state, is_final=is_final_round)
+
         summary_metrics = {
             "job_id": self.job_id,
             "round": round_num,
