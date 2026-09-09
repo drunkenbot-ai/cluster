@@ -462,27 +462,83 @@ class StandaloneStorageBus:
         return res
 
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
+        return self.get_worker_shard_assignment(job_id, worker_id, round_num=0)
+
+    def get_worker_shard_assignment(self, job_id: str, worker_id: str, round_num: int = 0) -> tuple[int, int]:
         with self._connect() as conn:
             cursor = conn.execute(
-                "SELECT shard_index, total_shards FROM job_participants WHERE job_id = ? AND worker_id = ?;",
+                "SELECT status FROM job_participants WHERE job_id = ? AND worker_id = ?;",
                 (job_id, worker_id),
             )
-            existing = cursor.fetchone()
-            if existing:
-                return int(existing["shard_index"]), int(existing["total_shards"])
+            row = cursor.fetchone()
+            if not row:
+                conn.execute("""
+                    INSERT INTO job_participants (job_id, worker_id, shard_index, total_shards, status)
+                    VALUES (?, ?, 0, 1, 'ACTIVE');
+                """, (job_id, worker_id))
+            elif row["status"] != "ACTIVE":
+                conn.execute(
+                    "UPDATE job_participants SET status = 'ACTIVE' WHERE job_id = ? AND worker_id = ?;",
+                    (job_id, worker_id),
+                )
 
-            cursor = conn.execute("SELECT COUNT(*) as cnt FROM job_participants WHERE job_id = ?;", (job_id,))
-            count = int(cursor.fetchone()["cnt"])
-            shard_idx = count
-            total = count + 1
+            cursor = conn.execute(
+                "SELECT worker_id FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
+                (job_id,),
+            )
+            active_ids = [r["worker_id"] for r in cursor.fetchall()]
+            total_active = max(len(active_ids), 1)
 
-            conn.execute("""
-                INSERT INTO job_participants (job_id, worker_id, shard_index, total_shards, status)
-                VALUES (?, ?, ?, ?, 'ACTIVE');
-            """, (job_id, worker_id, shard_idx, total))
+            try:
+                shard_idx = active_ids.index(worker_id)
+            except ValueError:
+                shard_idx = 0
 
-            conn.execute("UPDATE job_participants SET total_shards = ? WHERE job_id = ?;", (total, job_id))
-            return shard_idx, total
+            for idx, wid in enumerate(active_ids):
+                if wid == worker_id:
+                    conn.execute(
+                        "UPDATE job_participants SET shard_index = ?, total_shards = ?, last_synced_round = ? WHERE job_id = ? AND worker_id = ?;",
+                        (idx, total_active, round_num, job_id, wid),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
+                        (idx, total_active, job_id, wid),
+                    )
+            return shard_idx, total_active
+
+    def mark_worker_dropped(self, job_id: str, worker_id: str, reason: str = "timeout") -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE job_participants SET status = 'DROPPED' WHERE job_id = ? AND worker_id = ?;",
+                (job_id, worker_id),
+            )
+            cursor = conn.execute(
+                "SELECT worker_id FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
+                (job_id,),
+            )
+            active_ids = [r["worker_id"] for r in cursor.fetchall()]
+            total_active = max(len(active_ids), 1)
+            for idx, wid in enumerate(active_ids):
+                conn.execute(
+                    "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
+                    (idx, total_active, job_id, wid),
+                )
+
+    def save_worker_telemetry(self, job_id: str, round_num: int, worker_id: str, telemetry: dict[str, Any]) -> None:
+        round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        target = round_dir / f"{worker_id}_telemetry.json"
+        target.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+
+    def load_worker_telemetry(self, job_id: str, round_num: int, worker_id: str) -> Optional[dict[str, Any]]:
+        target = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / f"{worker_id}_telemetry.json"
+        if not target.exists():
+            return None
+        try:
+            return json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def is_paused(self, job_id: str) -> bool:
         return (self.jobs_dir / job_id / "signals" / "pause.sig").exists()
@@ -854,6 +910,15 @@ class StandaloneWorker:
                 if self.bus.is_stopped(job_id):
                     break
 
+            # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
+            new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
+            if new_shard_idx != shard_idx or new_total_shards != total_shards:
+                print(f"[ClusterWorker] Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
+                shard_idx, total_shards = new_shard_idx, new_total_shards
+                dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards)
+                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                dataloader_iter = iter(dataloader)
+
             # Sync from global model if round > 0
             if cur_round > 0:
                 print(f"[ClusterWorker] Waiting for global averaged model round {cur_round - 1}...")
@@ -872,6 +937,8 @@ class StandaloneWorker:
             model.train()
             self.bus.heartbeat(self.worker_id, status="TRAINING", current_job_id=job_id)
 
+            start_time = time.time()
+            tokens_processed = 0
             step_losses = []
             for _ in range(sync_steps):
                 if self.bus.is_stopped(job_id):
@@ -883,6 +950,7 @@ class StandaloneWorker:
                     batch = next(dataloader_iter)
 
                 x, y = batch
+                tokens_processed += int(x.numel())
                 x = x.to(self.device_str, non_blocking=True)
                 y = y.to(self.device_str, non_blocking=True)
 
@@ -893,8 +961,10 @@ class StandaloneWorker:
                 optimizer.step()
                 step_losses.append(float(loss.item()))
 
+            elapsed = max(time.time() - start_time, 1e-4)
+            tokens_per_sec = tokens_processed / elapsed
             avg_loss = sum(step_losses) / max(len(step_losses), 1)
-            print(f"[ClusterWorker] Finished round {cur_round} (avg loss: {avg_loss:.4f}). Depositing weights...")
+            print(f"[ClusterWorker] Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
 
             # Save local weights
             self.bus.save_worker_weights(
@@ -902,6 +972,22 @@ class StandaloneWorker:
                 round_num=cur_round,
                 worker_id=self.worker_id,
                 state_dict={k: v.cpu() for k, v in model.state_dict().items()},
+            )
+
+            # Save local telemetry
+            self.bus.save_worker_telemetry(
+                job_id=job_id,
+                round_num=cur_round,
+                worker_id=self.worker_id,
+                telemetry={
+                    "worker_id": self.worker_id,
+                    "round": cur_round,
+                    "steps_completed": sync_steps,
+                    "avg_loss": round(avg_loss, 4),
+                    "tokens_processed": tokens_processed,
+                    "tokens_per_sec": round(tokens_per_sec, 1),
+                    "timestamp": time.time(),
+                },
             )
 
             # Wait for coordinator to publish global model

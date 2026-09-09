@@ -108,9 +108,14 @@ class ClusterStorageBus:
                     participating_workers TEXT,
                     averaged_at REAL,
                     avg_loss REAL,
+                    metrics TEXT,
                     PRIMARY KEY (job_id, round_number)
                 );
             """)
+            try:
+                conn.execute("ALTER TABLE round_history ADD COLUMN metrics TEXT;")
+            except Exception:
+                pass
 
     # -------------------------------------------------------------------------
     # Worker Lifecycle & Heartbeats
@@ -355,13 +360,159 @@ class ClusterStorageBus:
             return shard_idx, total
 
     def get_job_participants(self, job_id: str) -> list[dict[str, Any]]:
-        """Get all participants for a job."""
+        """Get all active participants for a job."""
         with self._connect() as conn:
             cursor = conn.execute(
-                "SELECT * FROM job_participants WHERE job_id = ? AND status = 'ACTIVE';",
+                "SELECT * FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
                 (job_id,),
             )
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_worker_shard_assignment(
+        self,
+        job_id: str,
+        worker_id: str,
+        round_num: int = 0,
+    ) -> tuple[int, int]:
+        """Dynamically return (shard_index, total_shards) based strictly on currently active workers.
+
+        If a worker drops or crashes, the surviving active workers are re-indexed across
+        0..M-1 so that 100% of the dataset token range is partitioned among active workers.
+        """
+        with self._connect() as conn:
+            # Ensure this worker is registered as ACTIVE if not already
+            cursor = conn.execute(
+                "SELECT status FROM job_participants WHERE job_id = ? AND worker_id = ?;",
+                (job_id, worker_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                conn.execute("""
+                    INSERT INTO job_participants (job_id, worker_id, shard_index, total_shards, status)
+                    VALUES (?, ?, 0, 1, 'ACTIVE');
+                """, (job_id, worker_id))
+            elif row["status"] != "ACTIVE":
+                conn.execute(
+                    "UPDATE job_participants SET status = 'ACTIVE' WHERE job_id = ? AND worker_id = ?;",
+                    (job_id, worker_id),
+                )
+
+            # Retrieve all currently active participants sorted deterministically
+            cursor = conn.execute(
+                "SELECT worker_id FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
+                (job_id,),
+            )
+            active_ids = [r["worker_id"] for r in cursor.fetchall()]
+            total_active = max(len(active_ids), 1)
+
+            try:
+                shard_idx = active_ids.index(worker_id)
+            except ValueError:
+                shard_idx = 0
+
+            for idx, wid in enumerate(active_ids):
+                if wid == worker_id:
+                    conn.execute(
+                        "UPDATE job_participants SET shard_index = ?, total_shards = ?, last_synced_round = ? WHERE job_id = ? AND worker_id = ?;",
+                        (idx, total_active, round_num, job_id, wid),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
+                        (idx, total_active, job_id, wid),
+                    )
+            return shard_idx, total_active
+
+    def mark_worker_dropped(self, job_id: str, worker_id: str, reason: str = "timeout") -> None:
+        """Mark a worker as DROPPED so its workload is reallocated to remaining active workers."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE job_participants SET status = 'DROPPED' WHERE job_id = ? AND worker_id = ?;",
+                (job_id, worker_id),
+            )
+            # Rebalance total_shards across remaining active workers
+            cursor = conn.execute(
+                "SELECT worker_id FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
+                (job_id,),
+            )
+            active_ids = [r["worker_id"] for r in cursor.fetchall()]
+            total_active = max(len(active_ids), 1)
+            for idx, wid in enumerate(active_ids):
+                conn.execute(
+                    "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
+                    (idx, total_active, job_id, wid),
+                )
+
+    # -------------------------------------------------------------------------
+    # Telemetry & Metrics Persistence
+    # -------------------------------------------------------------------------
+
+    def save_worker_telemetry(
+        self,
+        job_id: str,
+        round_num: int,
+        worker_id: str,
+        telemetry: dict[str, Any],
+    ) -> Path:
+        """Save a worker's round telemetry (loss, tokens/sec, steps) to shared storage."""
+        round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        target = round_dir / f"{worker_id}_telemetry.json"
+        target.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+        return target
+
+    def load_worker_telemetry(
+        self,
+        job_id: str,
+        round_num: int,
+        worker_id: str,
+    ) -> Optional[dict[str, Any]]:
+        """Load a worker's deposited round telemetry."""
+        target = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / f"{worker_id}_telemetry.json"
+        if not target.exists():
+            return None
+        try:
+            return json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def record_round_summary(
+        self,
+        job_id: str,
+        round_num: int,
+        participating_workers: list[str],
+        avg_loss: float,
+        metrics: dict[str, Any],
+    ) -> None:
+        """Record global round aggregation telemetry into SQLite round_history."""
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO round_history (job_id, round_number, participating_workers, averaged_at, avg_loss, metrics)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (
+                job_id,
+                round_num,
+                json.dumps(participating_workers),
+                now,
+                avg_loss,
+                json.dumps(metrics),
+            ))
+
+    def get_all_round_history(self, job_id: str) -> list[dict[str, Any]]:
+        """Fetch all recorded round history summaries for a job."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM round_history WHERE job_id = ? ORDER BY round_number ASC;",
+                (job_id,),
+            )
+            rows = []
+            for r in cursor.fetchall():
+                d = dict(r)
+                d["participating_workers"] = json.loads(d["participating_workers"]) if d.get("participating_workers") else []
+                d["metrics"] = json.loads(d["metrics"]) if d.get("metrics") else {}
+                rows.append(d)
+            return rows
 
     # -------------------------------------------------------------------------
     # Binary Tensor Checkpoint Exchange (Atomic Save / Load)
