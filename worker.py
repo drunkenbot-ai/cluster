@@ -403,20 +403,26 @@ class ClusterWorker:
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
-        while not self._stop_event.is_set():
-            self._current_status = "IDLE"
+        try:
+            while not self._stop_event.is_set():
+                self._current_status = "IDLE"
+                self._current_job_id = None
+
+                try:
+                    active_job = self.bus.get_active_job()
+                    if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
+                        self.execute_job(active_job, poll_interval=poll_interval)
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.log(f"Error in worker daemon:\n{tb}", level="ERROR")
+                    time.sleep(poll_interval * 2)
+
+                self._stop_event.wait(poll_interval)
+        finally:
+            self._current_status = "OFFLINE"
             self._current_job_id = None
-
             try:
-                active_job = self.bus.get_active_job()
-                if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
-                    self.execute_job(active_job, poll_interval=poll_interval)
-            except Exception as exc:
-                import traceback
-                tb = traceback.format_exc()
-                self.log(f"Error in worker daemon:\n{tb}", level="ERROR")
-                time.sleep(poll_interval * 2)
-
-            self._stop_event.wait(poll_interval)
-
-            self._stop_event.wait(poll_interval)
+                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+            except Exception:
+                pass

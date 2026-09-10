@@ -97,6 +97,10 @@ class ClusterCoordinator:
         first_ready_time: Optional[float] = None
 
         while True:
+            # Signal coordinator liveness
+            if hasattr(self.bus, "touch_job"):
+                self.bus.touch_job(self.job_id)
+
             # Check for stop signal
             if self.bus.is_stopped(self.job_id):
                 return None

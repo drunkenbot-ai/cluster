@@ -555,10 +555,54 @@ class StandaloneStorageBus:
             return cursor.rowcount
         return int(self._run_with_retry(_op, default_on_error=0))
 
-    def get_active_job(self) -> Optional[dict[str, Any]]:
+    def touch_job(self, job_id: str) -> None:
+        """Update job updated_at timestamp to signal active coordinator heartbeat."""
+        now = time.time()
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute("UPDATE jobs SET updated_at = ? WHERE job_id = ?;", (now, job_id))
+        self._run_with_retry(_op, silent=True)
+
+    def set_worker_status(self, worker_id: str, status: str) -> None:
+        """Explicitly set a worker's status (e.g. 'OFFLINE', 'IDLE')."""
+        self.heartbeat(worker_id, status=status, current_job_id=None)
+
+    def list_workers(self, active_within_seconds: float = 60.0) -> list[dict[str, Any]]:
+        """List all workers, calculating online status based on heartbeat freshness."""
+        now = time.time()
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            cursor = conn.execute("SELECT * FROM workers ORDER BY created_at ASC;")
+            return [dict(r) for r in cursor.fetchall()]
+        rows = self._run_with_retry(_op, default_on_error=[])
+
+        results = []
+        for r in rows:
+            data = dict(r)
+            last_hb = float(data.get("last_heartbeat") or 0)
+            is_fresh = (now - last_hb) < active_within_seconds
+            stored_status = str(data.get("status") or "OFFLINE").upper()
+            if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
+                data["is_online"] = False
+                data["status"] = "OFFLINE"
+            else:
+                data["is_online"] = True
+            results.append(data)
+        return results
+
+    def get_active_job(self, max_stale_seconds: float = 60.0) -> Optional[dict[str, Any]]:
+        now = time.time()
         def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+            if max_stale_seconds > 0:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'STOPPED', updated_at = ?
+                    WHERE status IN ('RUNNING', 'QUEUED')
+                      AND (? - updated_at) > ?;
+                    """,
+                    (now, now, max_stale_seconds),
+                )
             cursor = conn.execute(
-                "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at ASC LIMIT 1;"
+                "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at DESC LIMIT 1;"
             )
             row = cursor.fetchone()
             if not row:
@@ -1094,6 +1138,23 @@ class StandaloneWorker:
         self.log(f"Central Storage: {self.bus.shared_dir.resolve()} | PID: {os.getpid()} ({self.device_tag})")
         self.log("Waiting for cluster jobs...")
 
+        def _cleanup():
+            try:
+                self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                release_singleton_lock(self.device_tag)
+            except Exception:
+                pass
+
+        import atexit, signal
+        atexit.register(_cleanup)
+        try:
+            signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+            signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, lambda s, f: sys.exit(0))
+        except Exception:
+            pass
+
         while True:
             try:
                 cmd = self.bus.get_worker_command(self.worker_id)
@@ -1227,8 +1288,17 @@ class StandaloneWorker:
                 start_time = time.time()
                 tokens_processed = 0
                 step_losses = []
-                for _ in range(sync_steps):
+                for step_idx in range(sync_steps):
+                    if step_idx % 5 == 0:
+                        cmd = self.bus.get_worker_command(self.worker_id)
+                        if cmd == "STOP":
+                            self.log("Received STOP command during training. Shutting down...")
+                            self.bus.set_worker_command(self.worker_id, None)
+                            self._heartbeat(status="OFFLINE", current_job_id=None)
+                            release_singleton_lock(self.device_tag)
+                            sys.exit(0)
                     if self.bus.is_stopped(job_id):
+                        self.log(f"Job {job_id} stopped. Aborting training loop.")
                         return
                     try:
                         batch = next(dataloader_iter)
@@ -1300,6 +1370,13 @@ class StandaloneWorker:
             self.log(f"Training failed for job {job_id}:\n{tb}", level="ERROR")
             self._heartbeat(status="ERROR", current_job_id=job_id)
             return
+        finally:
+            try:
+                cmd = self.bus.get_worker_command(self.worker_id)
+                if cmd != "STOP":
+                    self._heartbeat(status="IDLE", current_job_id=None)
+            except Exception:
+                pass
 
 
 # =============================================================================

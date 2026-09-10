@@ -269,12 +269,20 @@ class ClusterStorageBus:
         results = []
         for r in rows:
             data = dict(r)
-            is_online = (now - float(data.get("last_heartbeat") or 0)) < active_within_seconds
-            data["is_online"] = is_online
-            if not is_online:
+            last_hb = float(data.get("last_heartbeat") or 0)
+            is_fresh = (now - last_hb) < active_within_seconds
+            stored_status = str(data.get("status") or "OFFLINE").upper()
+            if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
+                data["is_online"] = False
                 data["status"] = "OFFLINE"
+            else:
+                data["is_online"] = True
             results.append(data)
         return results
+
+    def set_worker_status(self, worker_id: str, status: str) -> None:
+        """Explicitly set a worker's status (e.g. 'OFFLINE', 'IDLE')."""
+        self.heartbeat(worker_id, status=status, current_job_id=None)
 
     def set_worker_command(self, worker_id: str, command: Optional[str]) -> None:
         """Send a cooperative command signal (e.g. 'STOP', 'RESTART') to a worker."""
@@ -366,11 +374,30 @@ class ClusterStorageBus:
             return res
         return self._run_with_retry(_op, default_on_error=None, silent=True)
 
-    def get_active_job(self) -> Optional[dict[str, Any]]:
-        """Get the currently active or queued job."""
+    def touch_job(self, job_id: str) -> None:
+        """Update job updated_at timestamp to signal active coordinator heartbeat."""
+        now = time.time()
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute("UPDATE jobs SET updated_at = ? WHERE job_id = ?;", (now, job_id))
+        self._run_with_retry(_op, silent=True)
+
+    def get_active_job(self, max_stale_seconds: float = 60.0) -> Optional[dict[str, Any]]:
+        """Get the currently active or queued job, automatically sweeping stale uncoordinated jobs."""
+        now = time.time()
         def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+            # Auto-sweep stale uncoordinated jobs whose updated_at has lapsed
+            if max_stale_seconds > 0:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'STOPPED', updated_at = ?
+                    WHERE status IN ('RUNNING', 'QUEUED')
+                      AND (? - updated_at) > ?;
+                    """,
+                    (now, now, max_stale_seconds),
+                )
             cursor = conn.execute(
-                "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at ASC LIMIT 1;"
+                "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at DESC LIMIT 1;"
             )
             row = cursor.fetchone()
             if not row:
