@@ -22,6 +22,38 @@ from .worker import ClusterWorker
 def cmd_worker(args: argparse.Namespace) -> int:
     """Run a persistent headless worker daemon."""
     shared_dir = Path(args.shared_dir)
+
+    if getattr(args, "detach", False):
+        import subprocess
+        flags = 0
+        if sys.platform == "win32":
+            flags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+
+        cmd = [sys.executable, "-m", "cluster.cli"] + [arg for arg in sys.argv[1:] if arg not in ("--detach", "--background")]
+
+        log_dir = shared_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        wid_label = args.worker_id or "worker"
+        log_file_path = log_dir / f"{wid_label}.log"
+        log_out = open(log_file_path, "a", encoding="utf-8")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_out,
+            stderr=log_out,
+            stdin=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+        print(f"[Worker] Started detached background worker '{wid_label}' (PID: {proc.pid})")
+        print(f"[Worker] Output is being logged to: {log_file_path.resolve()}")
+        print("[Worker] You can now safely close this PowerShell window.")
+        return 0
+
     bus = ClusterStorageBus(shared_dir)
     worker = ClusterWorker(
         bus=bus,
@@ -157,6 +189,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_worker.add_argument("--device", default=None, help="Device to use (e.g. 'cuda:0', 'cpu')")
     p_worker.add_argument("--heartbeat-interval", type=float, default=5.0, help="Heartbeat interval in seconds")
     p_worker.add_argument("--poll-interval", type=float, default=2.0, help="Job polling interval in seconds")
+    p_worker.add_argument("--detach", "--background", action="store_true", help="Launch detached in background so you can close this terminal")
     p_worker.set_defaults(func=cmd_worker)
 
     # Status subcommand

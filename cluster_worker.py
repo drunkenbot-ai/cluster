@@ -1177,6 +1177,7 @@ def main() -> int:
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds")
     parser.add_argument("--stop", action="store_true", help="Stop active background worker process(es) on this machine")
     parser.add_argument("--status", action="store_true", help="Check status of background worker(s) on this machine")
+    parser.add_argument("--detach", "--background", action="store_true", help="Launch worker in the background detached from this terminal")
     args = parser.parse_args()
 
     shared_dir = args.shared_dir or os.environ.get("LLM_SHARED_DIR")
@@ -1201,6 +1202,37 @@ def main() -> int:
         print("  1. Set the LLM_SHARED_DIR environment variable: e.g. set LLM_SHARED_DIR=Z:\\llm_cluster")
         print("  2. Pass the argument: python cluster_worker.py --shared-dir Z:\\llm_cluster")
         return 1
+
+    # Handle detached background launch
+    if getattr(args, "detach", False):
+        flags = 0
+        if sys.platform == "win32":
+            flags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            )
+        worker_exe = get_worker_executable()
+        script_path = str(Path(__file__).resolve())
+        cmd = [worker_exe, script_path] + [arg for arg in sys.argv[1:] if arg not in ("--detach", "--background")]
+        log_dir = Path(shared_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        wid_label = args.worker_id or f"{socket.gethostname()}_{get_device_tag(args.device or 'auto')}"
+        log_file_path = log_dir / f"{wid_label}.log"
+        log_out = open(log_file_path, "a", encoding="utf-8")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_out,
+            stderr=log_out,
+            stdin=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+        print(f"[ClusterWorker] Started detached background worker '{wid_label}' (PID: {proc.pid})")
+        print(f"[ClusterWorker] Output is being logged to: {log_file_path.resolve()}")
+        print("[ClusterWorker] You can now safely close this PowerShell window.")
+        return 0
 
     # Handle multi-GPU launch
     if args.all_gpus:
