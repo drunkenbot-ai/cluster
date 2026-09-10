@@ -1,7 +1,7 @@
 """Centralized storage bus and SQLite coordination for port-blocked clusters.
 
 Operates over shared network filesystems (SMB, NFS, NAS) using:
-1. SQLite in WAL mode with aggressive busy timeouts and ephemeral connections.
+1. SQLite in network-compatible TRUNCATE journal mode with busy timeouts and ephemeral connections.
 2. Atomic filesystem renames for binary tensor checkpoints.
 3. Signal file detection for sub-second cooperative pause and stop actions.
 """
@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import random
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Callable, Generator, Optional
 
 import torch
 
@@ -36,27 +37,69 @@ class ClusterStorageBus:
 
     @contextlib.contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        """Ephemeral connection context manager to minimize network drive lock duration."""
-        conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            isolation_level="DEFERRED",
-        )
-        conn.row_factory = sqlite3.Row
+        """Ephemeral connection context manager with retries to handle network storage locking."""
+        conn = None
+        for attempt in range(5):
+            try:
+                conn = sqlite3.connect(
+                    str(self.db_path),
+                    timeout=60.0,
+                    isolation_level="DEFERRED",
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 60000;")
+                break
+            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
         try:
-            conn.execute("PRAGMA busy_timeout = 30000;")
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise
         finally:
-            conn.close()
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _run_with_retry(
+        self,
+        fn: Callable[[sqlite3.Connection], Any],
+        max_retries: int = 5,
+        default_on_error: Any = None,
+        silent: bool = False,
+    ) -> Any:
+        """Execute a database function with automatic retry on SQLite operational/locking errors."""
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                with self._connect() as conn:
+                    return fn(conn)
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                last_err = exc
+                if attempt == max_retries - 1:
+                    if silent:
+                        return default_on_error
+                    raise
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
+        return default_on_error
 
     def _init_db(self) -> None:
-        """Initialize database tables with WAL mode."""
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode = WAL;")
+        """Initialize database tables with network-compatible journal mode."""
+        def _init(conn: sqlite3.Connection) -> None:
+            try:
+                conn.execute("PRAGMA journal_mode = TRUNCATE;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id TEXT PRIMARY KEY,
@@ -135,6 +178,7 @@ class ClusterStorageBus:
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
+        self._run_with_retry(_init)
 
     # -------------------------------------------------------------------------
     # Worker Lifecycle & Heartbeats
@@ -149,7 +193,7 @@ class ClusterStorageBus:
     ) -> None:
         """Register or update a compute worker node."""
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT INTO workers (worker_id, hostname, gpu_name, vram_gb, status, last_heartbeat, created_at)
                 VALUES (?, ?, ?, ?, 'IDLE', ?, ?)
@@ -160,6 +204,7 @@ class ClusterStorageBus:
                     status = 'IDLE',
                     last_heartbeat = excluded.last_heartbeat;
             """, (worker_id, hostname, gpu_name, vram_gb, now, now))
+        self._run_with_retry(_op)
 
     def heartbeat(
         self,
@@ -170,13 +215,13 @@ class ClusterStorageBus:
     ) -> None:
         """Update a worker's last heartbeat timestamp, status, and resource usage metrics."""
         now = time.time()
-        with self._connect() as conn:
-            cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
-            ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
-            ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
-            vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
-            metrics_str = json.dumps(metrics, default=str) if metrics else None
+        cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
+        ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
+        ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
+        vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
+        metrics_str = json.dumps(metrics, default=str) if metrics else None
 
+        def _op(conn: sqlite3.Connection) -> None:
             if status is not None and metrics is not None:
                 conn.execute("""
                     UPDATE workers
@@ -211,13 +256,15 @@ class ClusterStorageBus:
                     SET last_heartbeat = ?
                     WHERE worker_id = ?;
                 """, (now, worker_id))
+        self._run_with_retry(_op, silent=True)
 
     def list_workers(self, active_within_seconds: float = 60.0) -> list[dict[str, Any]]:
         """List all workers, calculating online status based on heartbeat freshness."""
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             cursor = conn.execute("SELECT * FROM workers ORDER BY created_at ASC;")
-            rows = cursor.fetchall()
+            return [dict(r) for r in cursor.fetchall()]
+        rows = self._run_with_retry(_op, default_on_error=[])
 
         results = []
         for r in rows:
@@ -231,32 +278,36 @@ class ClusterStorageBus:
 
     def set_worker_command(self, worker_id: str, command: Optional[str]) -> None:
         """Send a cooperative command signal (e.g. 'STOP', 'RESTART') to a worker."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE workers SET command = ? WHERE worker_id = ?;", (command, worker_id))
+        self._run_with_retry(_op, silent=True)
 
     def get_worker_command(self, worker_id: str) -> Optional[str]:
         """Check for pending cooperative commands for this worker."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> Optional[str]:
             cursor = conn.execute("SELECT command FROM workers WHERE worker_id = ?;", (worker_id,))
             row = cursor.fetchone()
             return row["command"] if row and row["command"] else None
+        return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def delete_worker(self, worker_id: str) -> bool:
         """Delete a worker record from the database."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
             return cursor.rowcount > 0
+        return bool(self._run_with_retry(_op, default_on_error=False))
 
     def delete_offline_workers(self, stale_threshold_seconds: float = 60.0) -> int:
         """Delete all stale/offline workers from the database."""
         now = time.time()
         cutoff = now - stale_threshold_seconds
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
                 "DELETE FROM workers WHERE status = 'OFFLINE' OR last_heartbeat < ?;",
                 (cutoff,),
             )
             return cursor.rowcount
+        return int(self._run_with_retry(_op, default_on_error=0))
 
     # -------------------------------------------------------------------------
     # Job Management & Scheduling
@@ -280,7 +331,7 @@ class ClusterStorageBus:
         (job_dir / "signals").mkdir(parents=True, exist_ok=True)
         (job_dir / "rounds").mkdir(parents=True, exist_ok=True)
 
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT INTO jobs (
                     job_id, status, model_config, training_config, dataset_path,
@@ -300,41 +351,45 @@ class ClusterStorageBus:
                 now,
                 now,
             ))
+        self._run_with_retry(_op)
 
     def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
         """Retrieve details for a specific job."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             cursor = conn.execute("SELECT * FROM jobs WHERE job_id = ?;", (job_id,))
             row = cursor.fetchone()
-        if not row:
-            return None
-        res = dict(row)
-        res["model_config"] = json.loads(res["model_config"])
-        res["training_config"] = json.loads(res["training_config"])
-        return res
+            if not row:
+                return None
+            res = dict(row)
+            res["model_config"] = json.loads(res["model_config"])
+            res["training_config"] = json.loads(res["training_config"])
+            return res
+        return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def get_active_job(self) -> Optional[dict[str, Any]]:
         """Get the currently active or queued job."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at ASC LIMIT 1;"
             )
             row = cursor.fetchone()
-        if not row:
-            return None
-        res = dict(row)
-        res["model_config"] = json.loads(res["model_config"])
-        res["training_config"] = json.loads(res["training_config"])
-        return res
+            if not row:
+                return None
+            res = dict(row)
+            res["model_config"] = json.loads(res["model_config"])
+            res["training_config"] = json.loads(res["training_config"])
+            return res
+        return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def set_job_status(self, job_id: str, status: str) -> None:
         """Update job status and manage signal files."""
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE jobs SET status = ?, updated_at = ? WHERE job_id = ?;",
                 (status, now, job_id),
             )
+        self._run_with_retry(_op)
 
         job_dir = self.jobs_dir / job_id
         signals_dir = job_dir / "signals"
@@ -352,11 +407,12 @@ class ClusterStorageBus:
     def advance_job_round(self, job_id: str, new_round: int) -> None:
         """Advance job to the next synchronization round."""
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE jobs SET current_round = ?, updated_at = ? WHERE job_id = ?;",
                 (new_round, now, job_id),
             )
+        self._run_with_retry(_op)
 
     # -------------------------------------------------------------------------
     # Signals (Fast Local Check without DB query)
@@ -376,7 +432,7 @@ class ClusterStorageBus:
 
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
         """Claim a shard index for a job. Returns (shard_index, total_shards)."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> tuple[int, int]:
             # Check if worker already has a slot
             cursor = conn.execute(
                 "SELECT shard_index, total_shards FROM job_participants WHERE job_id = ? AND worker_id = ?;",
@@ -406,15 +462,17 @@ class ClusterStorageBus:
                 (total, job_id),
             )
             return shard_idx, total
+        return self._run_with_retry(_op)
 
     def get_job_participants(self, job_id: str) -> list[dict[str, Any]]:
         """Get all active participants for a job."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT * FROM job_participants WHERE job_id = ? AND status = 'ACTIVE' ORDER BY worker_id ASC;",
                 (job_id,),
             )
             return [dict(r) for r in cursor.fetchall()]
+        return self._run_with_retry(_op, default_on_error=[])
 
     def get_worker_shard_assignment(
         self,
@@ -427,7 +485,7 @@ class ClusterStorageBus:
         If a worker drops or crashes, the surviving active workers are re-indexed across
         0..M-1 so that 100% of the dataset token range is partitioned among active workers.
         """
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> tuple[int, int]:
             # Ensure this worker is registered as ACTIVE if not already
             cursor = conn.execute(
                 "SELECT status FROM job_participants WHERE job_id = ? AND worker_id = ?;",
@@ -470,10 +528,11 @@ class ClusterStorageBus:
                         (idx, total_active, job_id, wid),
                     )
             return shard_idx, total_active
+        return self._run_with_retry(_op)
 
     def mark_worker_dropped(self, job_id: str, worker_id: str, reason: str = "timeout") -> None:
         """Mark a worker as DROPPED so its workload is reallocated to remaining active workers."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE job_participants SET status = 'DROPPED' WHERE job_id = ? AND worker_id = ?;",
                 (job_id, worker_id),
@@ -490,6 +549,7 @@ class ClusterStorageBus:
                     "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
                     (idx, total_active, job_id, wid),
                 )
+        self._run_with_retry(_op, silent=True)
 
     # -------------------------------------------------------------------------
     # Telemetry & Metrics Persistence
@@ -534,7 +594,7 @@ class ClusterStorageBus:
     ) -> None:
         """Record global round aggregation telemetry into SQLite round_history."""
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT OR REPLACE INTO round_history (job_id, round_number, participating_workers, averaged_at, avg_loss, metrics)
                 VALUES (?, ?, ?, ?, ?, ?);
@@ -546,10 +606,11 @@ class ClusterStorageBus:
                 avg_loss,
                 json.dumps(metrics, default=str),
             ))
+        self._run_with_retry(_op, silent=True)
 
     def get_all_round_history(self, job_id: str) -> list[dict[str, Any]]:
         """Fetch all recorded round history summaries for a job."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT * FROM round_history WHERE job_id = ? ORDER BY round_number ASC;",
                 (job_id,),
@@ -561,6 +622,7 @@ class ClusterStorageBus:
                 d["metrics"] = json.loads(d["metrics"]) if d.get("metrics") else {}
                 rows.append(d)
             return rows
+        return self._run_with_retry(_op, default_on_error=[])
 
     # -------------------------------------------------------------------------
     # Binary Tensor Checkpoint Exchange (Atomic Save / Load)
@@ -709,11 +771,12 @@ class ClusterStorageBus:
         """
         if not entries:
             return
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT INTO worker_logs (worker_id, timestamp, level, message) VALUES (?, ?, ?, ?);",
                 entries,
             )
+        self._run_with_retry(_op, silent=True)
 
     def write_worker_log(self, worker_id: str, message: str, level: str = "INFO") -> None:
         """Write a single worker log message."""
@@ -721,11 +784,11 @@ class ClusterStorageBus:
 
     def get_worker_logs(self, worker_id: str, limit: int = 200) -> list[dict[str, Any]]:
         """Retrieve recent diagnostic logs for a specific worker node."""
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT id, worker_id, timestamp, level, message FROM worker_logs WHERE worker_id = ? ORDER BY id DESC LIMIT ?;",
                 (worker_id, limit),
             )
             rows = cursor.fetchall()
-        return [dict(r) for r in reversed(rows)]
-
+            return [dict(r) for r in reversed(rows)]
+        return self._run_with_retry(_op, default_on_error=[])

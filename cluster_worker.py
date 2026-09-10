@@ -22,6 +22,7 @@ import json
 import math
 import os
 import platform
+import random
 import shutil
 import signal
 import socket
@@ -31,7 +32,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Callable, Generator, Optional
 
 
 # =============================================================================
@@ -338,21 +339,63 @@ class StandaloneStorageBus:
 
     @contextlib.contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level="DEFERRED")
-        conn.row_factory = sqlite3.Row
+        conn = None
+        for attempt in range(5):
+            try:
+                conn = sqlite3.connect(str(self.db_path), timeout=60.0, isolation_level="DEFERRED")
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 60000;")
+                break
+            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
         try:
-            conn.execute("PRAGMA busy_timeout = 30000;")
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             raise
         finally:
-            conn.close()
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _run_with_retry(
+        self,
+        fn: Callable[[sqlite3.Connection], Any],
+        max_retries: int = 5,
+        default_on_error: Any = None,
+        silent: bool = False,
+    ) -> Any:
+        """Execute a database function with automatic retry on SQLite operational/locking errors."""
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                with self._connect() as conn:
+                    return fn(conn)
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                last_err = exc
+                if attempt == max_retries - 1:
+                    if silent:
+                        return default_on_error
+                    raise
+                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
+        return default_on_error
 
     def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode = WAL;")
+        def _init(conn: sqlite3.Connection) -> None:
+            try:
+                conn.execute("PRAGMA journal_mode = TRUNCATE;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS workers (
                     worker_id TEXT PRIMARY KEY,
@@ -420,10 +463,11 @@ class StandaloneStorageBus:
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
+        self._run_with_retry(_init)
 
     def register_worker(self, worker_id: str, hostname: str, gpu_name: str, vram_gb: float) -> None:
         now = time.time()
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT INTO workers (worker_id, hostname, gpu_name, vram_gb, status, last_heartbeat, created_at)
                 VALUES (?, ?, ?, ?, 'IDLE', ?, ?)
@@ -434,6 +478,7 @@ class StandaloneStorageBus:
                     status = 'IDLE',
                     last_heartbeat = excluded.last_heartbeat;
             """, (worker_id, hostname, gpu_name, vram_gb, now, now))
+        self._run_with_retry(_op)
 
     def heartbeat(
         self,
@@ -443,13 +488,13 @@ class StandaloneStorageBus:
         metrics: Optional[dict[str, Any]] = None,
     ) -> None:
         now = time.time()
-        with self._connect() as conn:
-            cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
-            ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
-            ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
-            vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
-            metrics_str = json.dumps(metrics, default=str) if metrics else None
+        cpu_pct = float(metrics.get("cpu_percent", 0.0)) if metrics and "cpu_percent" in metrics else None
+        ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
+        ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
+        vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
+        metrics_str = json.dumps(metrics, default=str) if metrics else None
 
+        def _op(conn: sqlite3.Connection) -> None:
             if status is not None and metrics is not None:
                 conn.execute("""
                     UPDATE workers
@@ -479,50 +524,56 @@ class StandaloneStorageBus:
                 """, (now, cpu_pct, ram_used, ram_tot, vram_used, metrics_str, worker_id))
             else:
                 conn.execute("UPDATE workers SET last_heartbeat = ? WHERE worker_id = ?;", (now, worker_id))
+        self._run_with_retry(_op, silent=True)
 
     def set_worker_command(self, worker_id: str, command: Optional[str]) -> None:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute("UPDATE workers SET command = ? WHERE worker_id = ?;", (command, worker_id))
+        self._run_with_retry(_op, silent=True)
 
     def get_worker_command(self, worker_id: str) -> Optional[str]:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> Optional[str]:
             cursor = conn.execute("SELECT command FROM workers WHERE worker_id = ?;", (worker_id,))
             row = cursor.fetchone()
             return row["command"] if row and row["command"] else None
+        return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def delete_worker(self, worker_id: str) -> bool:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
             return cursor.rowcount > 0
+        return bool(self._run_with_retry(_op, default_on_error=False))
 
     def delete_offline_workers(self, stale_threshold_seconds: float = 60.0) -> int:
         now = time.time()
         cutoff = now - stale_threshold_seconds
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
                 "DELETE FROM workers WHERE status = 'OFFLINE' OR last_heartbeat < ?;",
                 (cutoff,),
             )
             return cursor.rowcount
+        return int(self._run_with_retry(_op, default_on_error=0))
 
     def get_active_job(self) -> Optional[dict[str, Any]]:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at ASC LIMIT 1;"
             )
             row = cursor.fetchone()
-        if not row:
-            return None
-        res = dict(row)
-        res["model_config"] = json.loads(res["model_config"])
-        res["training_config"] = json.loads(res["training_config"])
-        return res
+            if not row:
+                return None
+            res = dict(row)
+            res["model_config"] = json.loads(res["model_config"])
+            res["training_config"] = json.loads(res["training_config"])
+            return res
+        return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
         return self.get_worker_shard_assignment(job_id, worker_id, round_num=0)
 
     def get_worker_shard_assignment(self, job_id: str, worker_id: str, round_num: int = 0) -> tuple[int, int]:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> tuple[int, int]:
             cursor = conn.execute(
                 "SELECT status FROM job_participants WHERE job_id = ? AND worker_id = ?;",
                 (job_id, worker_id),
@@ -563,9 +614,10 @@ class StandaloneStorageBus:
                         (idx, total_active, job_id, wid),
                     )
             return shard_idx, total_active
+        return self._run_with_retry(_op)
 
     def mark_worker_dropped(self, job_id: str, worker_id: str, reason: str = "timeout") -> None:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE job_participants SET status = 'DROPPED' WHERE job_id = ? AND worker_id = ?;",
                 (job_id, worker_id),
@@ -581,6 +633,7 @@ class StandaloneStorageBus:
                     "UPDATE job_participants SET shard_index = ?, total_shards = ? WHERE job_id = ? AND worker_id = ?;",
                     (idx, total_active, job_id, wid),
                 )
+        self._run_with_retry(_op, silent=True)
 
     def save_worker_telemetry(self, job_id: str, round_num: int, worker_id: str, telemetry: dict[str, Any]) -> None:
         round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
@@ -666,23 +719,25 @@ class StandaloneStorageBus:
     def write_worker_logs(self, entries: list[tuple[str, float, str, str]]) -> None:
         if not entries:
             return
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT INTO worker_logs (worker_id, timestamp, level, message) VALUES (?, ?, ?, ?);",
                 entries,
             )
+        self._run_with_retry(_op, silent=True)
 
     def write_worker_log(self, worker_id: str, message: str, level: str = "INFO") -> None:
         self.write_worker_logs([(worker_id, time.time(), level, message)])
 
     def get_worker_logs(self, worker_id: str, limit: int = 200) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             cursor = conn.execute(
                 "SELECT id, worker_id, timestamp, level, message FROM worker_logs WHERE worker_id = ? ORDER BY id DESC LIMIT ?;",
                 (worker_id, limit),
             )
             rows = cursor.fetchall()
-        return [dict(r) for r in reversed(rows)]
+            return [dict(r) for r in reversed(rows)]
+        return self._run_with_retry(_op, default_on_error=[])
 
 
 # =============================================================================
@@ -703,8 +758,9 @@ def compute_shard_boundaries(total_tokens: int, shard_index: int, total_shards: 
 
 
 class StandaloneTokenDataset(Dataset):
-    def __init__(self, token_array: np.ndarray, context_length: int, shard_index: int = 0, total_shards: int = 1) -> None:
+    def __init__(self, token_array: np.ndarray, context_length: int, shard_index: int = 0, total_shards: int = 1, vocab_size: Optional[int] = None) -> None:
         self.context_length = context_length
+        self.vocab_size = vocab_size
         total_tokens = len(token_array)
         start_idx, end_idx = compute_shard_boundaries(total_tokens, shard_index, total_shards, context_length)
         self.tokens = token_array[start_idx:end_idx]
@@ -722,6 +778,9 @@ class StandaloneTokenDataset(Dataset):
             y = torch.from_numpy(self.tokens[start + 1 : end + 1].astype(np.int64))
         else:
             y = x.clone()
+        if self.vocab_size is not None and self.vocab_size > 0:
+            x = torch.clamp(x, 0, self.vocab_size - 1)
+            y = torch.clamp(y, 0, self.vocab_size - 1)
         return x, y
 
 
@@ -1036,24 +1095,27 @@ class StandaloneWorker:
         self.log("Waiting for cluster jobs...")
 
         while True:
-            cmd = self.bus.get_worker_command(self.worker_id)
-            if cmd == "STOP":
-                self.log(f"Received STOP command. Shutting down...")
-                self.bus.set_worker_command(self.worker_id, None)
-                self._heartbeat(status="OFFLINE", current_job_id=None)
-                release_singleton_lock(self.device_tag)
-                sys.exit(0)
-            elif cmd == "RESTART":
-                self.log(f"Received RESTART command. Resetting...")
-                self.bus.set_worker_command(self.worker_id, None)
+            try:
+                cmd = self.bus.get_worker_command(self.worker_id)
+                if cmd == "STOP":
+                    self.log(f"Received STOP command. Shutting down...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._heartbeat(status="OFFLINE", current_job_id=None)
+                    release_singleton_lock(self.device_tag)
+                    sys.exit(0)
+                elif cmd == "RESTART":
+                    self.log(f"Received RESTART command. Resetting...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._heartbeat(status="IDLE", current_job_id=None)
+                    time.sleep(1.0)
+
                 self._heartbeat(status="IDLE", current_job_id=None)
-                time.sleep(1.0)
+                active_job = self.bus.get_active_job()
 
-            self._heartbeat(status="IDLE", current_job_id=None)
-            active_job = self.bus.get_active_job()
-
-            if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
-                self._execute_job(active_job, poll_interval=poll_interval)
+                if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
+                    self._execute_job(active_job, poll_interval=poll_interval)
+            except Exception as exc:
+                self.log(f"Transient error in worker poll loop: {exc}", level="WARNING")
 
             time.sleep(poll_interval)
 
@@ -1074,14 +1136,33 @@ class StandaloneWorker:
                 return
 
             token_array = np.load(dataset_path, mmap_mode="r")
-            context_length = int(job.get("model_config", {}).get("context_length", 512))
-            dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards)
-            batch_size = int(job.get("training_config", {}).get("batch_size", 4))
+            model_cfg = job.get("model_config", {})
+            training_cfg = job.get("training_config", {})
+
+            # Auto-detect and guard against invalid vocab_size <= 1 or vocab_size < max token ID in dataset
+            vocab_size = int(model_cfg.get("vocab_size", 0) or 0)
+            sample_slice = token_array[:min(len(token_array), 100000)]
+            max_token_id = int(np.max(sample_slice)) if len(sample_slice) > 0 else 0
+
+            if vocab_size <= 1 or max_token_id >= vocab_size:
+                adjusted_vocab = max(max_token_id + 1, 256)
+                self.log(
+                    f"Model vocab_size ({vocab_size}) is invalid or smaller than dataset token ID ({max_token_id}). "
+                    f"Auto-adjusting vocab_size to {adjusted_vocab}.",
+                    level="WARNING",
+                )
+                vocab_size = adjusted_vocab
+                model_cfg["vocab_size"] = vocab_size
+
+            context_length = int(model_cfg.get("context_length", 512))
+            batch_size = int(training_cfg.get("batch_size", 4))
+            lr = float(training_cfg.get("learning_rate", 3e-4))
+
+            dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
             dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
             dataloader_iter = iter(dataloader)
 
-            model = build_worker_model(job.get("model_config", {}), self.device_str)
-            lr = float(job.get("training_config", {}).get("learning_rate", 3e-4))
+            model = build_worker_model(model_cfg, self.device_str)
             optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
             self.log(f"Initialized model for {self.worker_id} on {self.device_str}. Ready to train.")
         except Exception as exc:
@@ -1090,130 +1171,135 @@ class StandaloneWorker:
             self.log(f"Preparation failed for job {job_id}:\n{tb}", level="ERROR")
             self._heartbeat(status="ERROR", current_job_id=job_id)
             return
-        lr = float(job.get("training_config", {}).get("learning_rate", 3e-4))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
         max_rounds = int(job.get("max_rounds", 10))
         sync_steps = int(job.get("sync_interval_steps", 250))
         cur_round = int(job.get("current_round", 0))
 
-        while cur_round < max_rounds:
-            if self.bus.is_stopped(job_id):
-                print(f"[ClusterWorker] Job {job_id} stopped.")
-                break
-
-            cmd = self.bus.get_worker_command(self.worker_id)
-            if cmd == "STOP":
-                print(f"[ClusterWorker] Received STOP command during job {job_id}.")
-                self.bus.set_worker_command(self.worker_id, None)
-                self._heartbeat(status="OFFLINE", current_job_id=None)
-                release_singleton_lock(self.device_tag)
-                sys.exit(0)
-
-            # Handle cooperative pause
-            while self.bus.is_paused(job_id):
-                self._heartbeat(status="PAUSED", current_job_id=job_id)
-                time.sleep(1.0)
+        try:
+            while cur_round < max_rounds:
                 if self.bus.is_stopped(job_id):
+                    print(f"[ClusterWorker] Job {job_id} stopped.")
                     break
 
-            # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
-            new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
-            if new_shard_idx != shard_idx or new_total_shards != total_shards:
-                print(f"[ClusterWorker] Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
-                shard_idx, total_shards = new_shard_idx, new_total_shards
-                dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards)
-                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-                dataloader_iter = iter(dataloader)
+                cmd = self.bus.get_worker_command(self.worker_id)
+                if cmd == "STOP":
+                    print(f"[ClusterWorker] Received STOP command during job {job_id}.")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._heartbeat(status="OFFLINE", current_job_id=None)
+                    release_singleton_lock(self.device_tag)
+                    sys.exit(0)
 
-            # Sync from global model if round > 0
-            if cur_round > 0:
-                print(f"[ClusterWorker] Waiting for global averaged model round {cur_round - 1}...")
-                while not self.bus.is_global_weights_ready(job_id, cur_round - 1):
+                # Handle cooperative pause
+                while self.bus.is_paused(job_id):
+                    self._heartbeat(status="PAUSED", current_job_id=job_id)
+                    time.sleep(1.0)
+                    if self.bus.is_stopped(job_id):
+                        break
+
+                # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
+                new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
+                if new_shard_idx != shard_idx or new_total_shards != total_shards:
+                    print(f"[ClusterWorker] Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
+                    shard_idx, total_shards = new_shard_idx, new_total_shards
+                    dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
+                    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                    dataloader_iter = iter(dataloader)
+
+                # Sync from global model if round > 0
+                if cur_round > 0:
+                    print(f"[ClusterWorker] Waiting for global averaged model round {cur_round - 1}...")
+                    while not self.bus.is_global_weights_ready(job_id, cur_round - 1):
+                        if self.bus.is_stopped(job_id):
+                            return
+                        self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
+                        time.sleep(poll_interval)
+
+                    global_state = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
+                    model.load_state_dict(global_state)
+                    print(f"[ClusterWorker] Loaded round {cur_round - 1} global weights into {self.device_str}.")
+
+                # Local SGD training steps
+                print(f"[ClusterWorker] Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str})...")
+                model.train()
+                self._heartbeat(status="TRAINING", current_job_id=job_id)
+
+                start_time = time.time()
+                tokens_processed = 0
+                step_losses = []
+                for _ in range(sync_steps):
+                    if self.bus.is_stopped(job_id):
+                        return
+                    try:
+                        batch = next(dataloader_iter)
+                    except StopIteration:
+                        dataloader_iter = iter(dataloader)
+                        batch = next(dataloader_iter)
+
+                    x, y = batch
+                    tokens_processed += int(x.numel())
+                    x = x.to(self.device_str, non_blocking=True)
+                    y = y.to(self.device_str, non_blocking=True)
+
+                    optimizer.zero_grad()
+                    logits = model(x)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                    loss.backward()
+                    optimizer.step()
+                    step_losses.append(float(loss.item()))
+
+                elapsed = max(time.time() - start_time, 1e-4)
+                tokens_per_sec = tokens_processed / elapsed
+                avg_loss = sum(step_losses) / max(len(step_losses), 1)
+                print(f"[ClusterWorker] Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
+
+                # Save local weights
+                self.bus.save_worker_weights(
+                    job_id=job_id,
+                    round_num=cur_round,
+                    worker_id=self.worker_id,
+                    state_dict={k: v.cpu() for k, v in model.state_dict().items()},
+                )
+
+                # Save local telemetry
+                self.bus.save_worker_telemetry(
+                    job_id=job_id,
+                    round_num=cur_round,
+                    worker_id=self.worker_id,
+                    telemetry={
+                        "worker_id": self.worker_id,
+                        "round": cur_round,
+                        "steps_completed": sync_steps,
+                        "avg_loss": round(avg_loss, 4),
+                        "tokens_processed": tokens_processed,
+                        "tokens_per_sec": round(tokens_per_sec, 1),
+                        "timestamp": time.time(),
+                    },
+                )
+
+                # Wait for coordinator to publish global model
+                print(f"[ClusterWorker] Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
+                while not self.bus.is_global_weights_ready(job_id, cur_round):
                     if self.bus.is_stopped(job_id):
                         return
                     self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
                     time.sleep(poll_interval)
 
-                global_state = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
-                model.load_state_dict(global_state)
-                print(f"[ClusterWorker] Loaded round {cur_round - 1} global weights into {self.device_str}.")
+                # Load synchronized global model weights into local model for next round
+                global_weights = self.bus.load_global_weights(job_id, cur_round, device=self.device_str)
+                model.load_state_dict(global_weights)
+                print(f"[ClusterWorker] Successfully loaded averaged global weights for round {cur_round}.")
 
-            # Local SGD training steps
-            print(f"[ClusterWorker] Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str})...")
-            model.train()
-            self._heartbeat(status="TRAINING", current_job_id=job_id)
+                cur_round += 1
 
-            start_time = time.time()
-            tokens_processed = 0
-            step_losses = []
-            for _ in range(sync_steps):
-                if self.bus.is_stopped(job_id):
-                    return
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    dataloader_iter = iter(dataloader)
-                    batch = next(dataloader_iter)
-
-                x, y = batch
-                tokens_processed += int(x.numel())
-                x = x.to(self.device_str, non_blocking=True)
-                y = y.to(self.device_str, non_blocking=True)
-
-                optimizer.zero_grad()
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-                loss.backward()
-                optimizer.step()
-                step_losses.append(float(loss.item()))
-
-            elapsed = max(time.time() - start_time, 1e-4)
-            tokens_per_sec = tokens_processed / elapsed
-            avg_loss = sum(step_losses) / max(len(step_losses), 1)
-            print(f"[ClusterWorker] Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
-
-            # Save local weights
-            self.bus.save_worker_weights(
-                job_id=job_id,
-                round_num=cur_round,
-                worker_id=self.worker_id,
-                state_dict={k: v.cpu() for k, v in model.state_dict().items()},
-            )
-
-            # Save local telemetry
-            self.bus.save_worker_telemetry(
-                job_id=job_id,
-                round_num=cur_round,
-                worker_id=self.worker_id,
-                telemetry={
-                    "worker_id": self.worker_id,
-                    "round": cur_round,
-                    "steps_completed": sync_steps,
-                    "avg_loss": round(avg_loss, 4),
-                    "tokens_processed": tokens_processed,
-                    "tokens_per_sec": round(tokens_per_sec, 1),
-                    "timestamp": time.time(),
-                },
-            )
-
-            # Wait for coordinator to publish global model
-            print(f"[ClusterWorker] Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
-            while not self.bus.is_global_weights_ready(job_id, cur_round):
-                if self.bus.is_stopped(job_id):
-                    return
-                self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
-                time.sleep(poll_interval)
-
-            # Load synchronized global model weights into local model for next round
-            global_weights = self.bus.load_global_weights(job_id, cur_round, device=self.device_str)
-            model.load_state_dict(global_weights)
-            print(f"[ClusterWorker] Successfully loaded averaged global weights for round {cur_round}.")
-
-            cur_round += 1
-
-        print(f"[ClusterWorker] Job {job_id} finished. Returning to IDLE.")
-        self._heartbeat(status="IDLE", current_job_id=None)
+            print(f"[ClusterWorker] Job {job_id} finished. Returning to IDLE.")
+            self._heartbeat(status="IDLE", current_job_id=None)
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"Training failed for job {job_id}:\n{tb}", level="ERROR")
+            self._heartbeat(status="ERROR", current_job_id=job_id)
+            return
 
 
 # =============================================================================

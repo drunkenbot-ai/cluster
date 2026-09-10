@@ -299,11 +299,26 @@ class ClusterWorker:
                 return False
 
             token_array = np.load(dataset_path, mmap_mode="r")
+            vocab_size = int(model_config.get("vocab_size", 0) or 0)
+            sample_slice = token_array[:min(len(token_array), 100000)]
+            max_token_id = int(np.max(sample_slice)) if len(sample_slice) > 0 else 0
+
+            if vocab_size <= 1 or max_token_id >= vocab_size:
+                adjusted_vocab = max(max_token_id + 1, 256)
+                self.log(
+                    f"Model vocab_size ({vocab_size}) is invalid or smaller than dataset token ID ({max_token_id}). "
+                    f"Auto-adjusting vocab_size to {adjusted_vocab}.",
+                    level="WARNING",
+                )
+                vocab_size = adjusted_vocab
+                model_config["vocab_size"] = vocab_size
+
             dataset = ShardedTokenDataset(
                 token_array=token_array,
                 context_length=context_length,
                 shard_index=shard_idx,
                 total_shards=total_shards,
+                vocab_size=vocab_size,
             )
             dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
             dataloader_iter = iter(dataloader)

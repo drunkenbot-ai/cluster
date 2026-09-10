@@ -59,6 +59,7 @@ class ShardedTokenDataset(Dataset):
         total_shards: int = 1,
         stride: Optional[int] = None,
         target_array: Optional[np.ndarray] = None,
+        vocab_size: Optional[int] = None,
     ) -> None:
         """Create a sharded token dataset.
 
@@ -69,10 +70,12 @@ class ShardedTokenDataset(Dataset):
             total_shards: Total number of participating workers.
             stride: Token step stride between windows. Defaults to context_length.
             target_array: Optional target token array for loss masking.
+            vocab_size: Optional maximum vocabulary size to clamp out-of-range token IDs.
         """
         self.context_length = context_length
         self.stride = stride or context_length
         self.has_targets = target_array is not None
+        self.vocab_size = vocab_size
 
         # Compute worker slice boundaries
         total_tokens = len(token_array)
@@ -107,5 +110,9 @@ class ShardedTokenDataset(Dataset):
                 y = torch.from_numpy(target_chunk.astype(np.int64))
             else:
                 y = x.clone()
+
+        if self.vocab_size is not None and self.vocab_size > 0:
+            x = torch.clamp(x, 0, self.vocab_size - 1)
+            y = torch.clamp(y, 0, self.vocab_size - 1)
 
         return x, y
