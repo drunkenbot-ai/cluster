@@ -125,10 +125,16 @@ class ClusterStorageBus:
                     PRIMARY KEY (job_id, round_number)
                 );
             """)
-            try:
-                conn.execute("ALTER TABLE round_history ADD COLUMN metrics TEXT;")
-            except Exception:
-                pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    worker_id TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    level TEXT DEFAULT 'INFO',
+                    message TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
 
     # -------------------------------------------------------------------------
     # Worker Lifecycle & Heartbeats
@@ -690,3 +696,36 @@ class ClusterStorageBus:
         if final.exists():
             return torch.load(final, map_location=device)
         return None
+
+    # -------------------------------------------------------------------------
+    # Worker Logging to SQLite
+    # -------------------------------------------------------------------------
+
+    def write_worker_logs(self, entries: list[tuple[str, float, str, str]]) -> None:
+        """Batch write worker log messages into SQLite bus.
+
+        Args:
+            entries: List of (worker_id, timestamp, level, message) tuples.
+        """
+        if not entries:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO worker_logs (worker_id, timestamp, level, message) VALUES (?, ?, ?, ?);",
+                entries,
+            )
+
+    def write_worker_log(self, worker_id: str, message: str, level: str = "INFO") -> None:
+        """Write a single worker log message."""
+        self.write_worker_logs([(worker_id, time.time(), level, message)])
+
+    def get_worker_logs(self, worker_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Retrieve recent diagnostic logs for a specific worker node."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT id, worker_id, timestamp, level, message FROM worker_logs WHERE worker_id = ? ORDER BY id DESC LIMIT ?;",
+                (worker_id, limit),
+            )
+            rows = cursor.fetchall()
+        return [dict(r) for r in reversed(rows)]
+
