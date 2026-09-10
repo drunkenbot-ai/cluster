@@ -286,119 +286,149 @@ class ClusterWorker:
         lr = float(training_config.get("learning_rate", 3e-4))
         context_length = int(model_config.get("context_length", 512))
 
-        try:
-            # Claim data shard slot
-            shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
-            self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
+        model = None
+        optimizer = None
+        dataloader = None
+        dataloader_iter = None
+        dataset = None
+        token_array = None
 
-            # Prepare dataset
-            if not os.path.exists(dataset_path):
-                err = f"Dataset path not found on shared storage: {dataset_path}"
-                self.log(err, level="ERROR")
+        try:
+            try:
+                # Claim data shard slot
+                shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
+                self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
+
+                # Prepare dataset
+                if not os.path.exists(dataset_path):
+                    err = f"Dataset path not found on shared storage: {dataset_path}"
+                    self.log(err, level="ERROR")
+                    self._current_status = "ERROR"
+                    return False
+
+                token_array = np.load(dataset_path, mmap_mode="r")
+                vocab_size = int(model_config.get("vocab_size", 0) or 0)
+                sample_slice = token_array[:min(len(token_array), 100000)]
+                max_token_id = int(np.max(sample_slice)) if len(sample_slice) > 0 else 0
+
+                if vocab_size <= 1 or max_token_id >= vocab_size:
+                    adjusted_vocab = max(max_token_id + 1, 256)
+                    self.log(
+                        f"Model vocab_size ({vocab_size}) is invalid or smaller than dataset token ID ({max_token_id}). "
+                        f"Auto-adjusting vocab_size to {adjusted_vocab}.",
+                        level="WARNING",
+                    )
+                    vocab_size = adjusted_vocab
+                    model_config["vocab_size"] = vocab_size
+
+                dataset = ShardedTokenDataset(
+                    token_array=token_array,
+                    context_length=context_length,
+                    shard_index=shard_idx,
+                    total_shards=total_shards,
+                    vocab_size=vocab_size,
+                )
+                dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                dataloader_iter = iter(dataloader)
+
+                # Build model and optimizer
+                model = build_model_from_config(model_config, self.device_str)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+                self.log(f"Model initialized on device '{self.device_str}'. Ready to train {max_rounds} rounds.")
+            except Exception as exc:
+                import traceback
+                tb = traceback.format_exc()
+                self.log(f"Preparation failed for job {job_id}:\n{tb}", level="ERROR")
                 self._current_status = "ERROR"
                 return False
 
-            token_array = np.load(dataset_path, mmap_mode="r")
-            vocab_size = int(model_config.get("vocab_size", 0) or 0)
-            sample_slice = token_array[:min(len(token_array), 100000)]
-            max_token_id = int(np.max(sample_slice)) if len(sample_slice) > 0 else 0
+            current_round = int(job.get("current_round", 0))
 
-            if vocab_size <= 1 or max_token_id >= vocab_size:
-                adjusted_vocab = max(max_token_id + 1, 256)
-                self.log(
-                    f"Model vocab_size ({vocab_size}) is invalid or smaller than dataset token ID ({max_token_id}). "
-                    f"Auto-adjusting vocab_size to {adjusted_vocab}.",
-                    level="WARNING",
+            while current_round < max_rounds and not self._stop_event.is_set():
+                if self.bus.is_stopped(job_id):
+                    self._current_status = "STOPPED"
+                    self.log(f"Job {job_id} stopped.")
+                    return False
+
+                # If round > 0, wait for and synchronize from previous global averaged model
+                if current_round > 0:
+                    self._current_status = "SYNC_WAIT"
+                    while not self.bus.is_global_weights_ready(job_id, current_round - 1):
+                        if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                            return False
+                        time.sleep(poll_interval)
+
+                    global_state = self.bus.load_global_weights(
+                        job_id, current_round - 1, device=self.device_str
+                    )
+                    model.load_state_dict(global_state)
+
+                # Train locally for K steps
+                self._current_status = "TRAINING"
+                self.log(f"Starting training round {current_round + 1}/{max_rounds} ({sync_interval_steps} local steps)...")
+                try:
+                    avg_loss, dataloader_iter = self.run_training_round(
+                        job_id=job_id,
+                        round_num=current_round,
+                        model=model,
+                        optimizer=optimizer,
+                        dataloader=dataloader,
+                        dataloader_iter=dataloader_iter,
+                        steps_per_round=sync_interval_steps,
+                        log_callback=log_callback,
+                    )
+                    self.log(f"Round {current_round + 1}/{max_rounds} completed. Avg loss: {avg_loss:.4f}. Depositing weights...")
+                except Exception as exc:
+                    import traceback
+                    tb = traceback.format_exc()
+                    self.log(f"Training round {current_round} crashed:\n{tb}", level="ERROR")
+                    self._current_status = "ERROR"
+                    return False
+
+                # Atomically deposit local worker weights
+                self.bus.save_worker_weights(
+                    job_id=job_id,
+                    round_num=current_round,
+                    worker_id=self.worker_id,
+                    state_dict={k: v.cpu() for k, v in model.state_dict().items()},
                 )
-                vocab_size = adjusted_vocab
-                model_config["vocab_size"] = vocab_size
 
-            dataset = ShardedTokenDataset(
-                token_array=token_array,
-                context_length=context_length,
-                shard_index=shard_idx,
-                total_shards=total_shards,
-                vocab_size=vocab_size,
-            )
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            dataloader_iter = iter(dataloader)
-
-            # Build model and optimizer
-            model = build_model_from_config(model_config, self.device_str)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-            self.log(f"Model initialized on device '{self.device_str}'. Ready to train {max_rounds} rounds.")
-        except Exception as exc:
-            import traceback
-            tb = traceback.format_exc()
-            self.log(f"Preparation failed for job {job_id}:\n{tb}", level="ERROR")
-            self._current_status = "ERROR"
-            return False
-
-        current_round = int(job.get("current_round", 0))
-
-        while current_round < max_rounds and not self._stop_event.is_set():
-            if self.bus.is_stopped(job_id):
-                self._current_status = "STOPPED"
-                self.log(f"Job {job_id} stopped.")
-                return False
-
-            # If round > 0, wait for and synchronize from previous global averaged model
-            if current_round > 0:
                 self._current_status = "SYNC_WAIT"
-                while not self.bus.is_global_weights_ready(job_id, current_round - 1):
+
+                # Wait for coordinator to publish global model for this round
+                while not self.bus.is_global_weights_ready(job_id, current_round):
                     if self._stop_event.is_set() or self.bus.is_stopped(job_id):
                         return False
                     time.sleep(poll_interval)
 
-                global_state = self.bus.load_global_weights(
-                    job_id, current_round - 1, device=self.device_str
-                )
-                model.load_state_dict(global_state)
+                current_round += 1
 
-            # Train locally for K steps
-            self._current_status = "TRAINING"
-            self.log(f"Starting training round {current_round + 1}/{max_rounds} ({sync_interval_steps} local steps)...")
+            self._current_status = "COMPLETED"
+            self._current_job_id = None
+            self.log(f"Job {job_id} successfully completed all {max_rounds} rounds.")
+            return True
+        finally:
             try:
-                avg_loss, dataloader_iter = self.run_training_round(
-                    job_id=job_id,
-                    round_num=current_round,
-                    model=model,
-                    optimizer=optimizer,
-                    dataloader=dataloader,
-                    dataloader_iter=dataloader_iter,
-                    steps_per_round=sync_interval_steps,
-                    log_callback=log_callback,
-                )
-                self.log(f"Round {current_round + 1}/{max_rounds} completed. Avg loss: {avg_loss:.4f}. Depositing weights...")
-            except Exception as exc:
-                import traceback
-                tb = traceback.format_exc()
-                self.log(f"Training round {current_round} crashed:\n{tb}", level="ERROR")
-                self._current_status = "ERROR"
-                return False
+                if model is not None:
+                    model.to("cpu")
+            except Exception:
+                pass
 
-            # Atomically deposit local worker weights
-            self.bus.save_worker_weights(
-                job_id=job_id,
-                round_num=current_round,
-                worker_id=self.worker_id,
-                state_dict={k: v.cpu() for k, v in model.state_dict().items()},
-            )
+            model = None
+            optimizer = None
+            dataloader = None
+            dataloader_iter = None
+            dataset = None
+            token_array = None
 
-            self._current_status = "SYNC_WAIT"
-
-            # Wait for coordinator to publish global model for this round
-            while not self.bus.is_global_weights_ready(job_id, current_round):
-                if self._stop_event.is_set() or self.bus.is_stopped(job_id):
-                    return False
-                time.sleep(poll_interval)
-
-            current_round += 1
-
-        self._current_status = "COMPLETED"
-        self._current_job_id = None
-        self.log(f"Job {job_id} successfully completed all {max_rounds} rounds.")
-        return True
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
 
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""

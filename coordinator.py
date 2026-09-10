@@ -258,3 +258,69 @@ class ClusterCoordinator:
             self.bus.set_job_status(self.job_id, "COMPLETED")
             return True
         return False
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """CLI entry point for running ClusterCoordinator as a standalone detached daemon."""
+    import argparse
+    import os
+    from pathlib import Path
+    import warnings
+
+    warnings.filterwarnings("ignore", category=FutureWarning, module="torch.cuda")
+
+    parser = argparse.ArgumentParser(description="Cluster Synchronization Coordinator for Local SGD")
+    parser.add_argument("--shared-dir", required=True, help="Central shared network directory")
+    parser.add_argument("--job-id", required=True, help="Unique cluster job ID")
+    parser.add_argument("--poll-interval", type=float, default=1.0, help="Polling interval in seconds")
+    args = parser.parse_args(argv)
+
+    storage_path = Path(args.shared_dir)
+    bus = ClusterStorageBus(storage_path)
+    coordinator = ClusterCoordinator(bus, args.job_id)
+
+    pid_file = bus.jobs_dir / args.job_id / "coordinator.pid"
+    try:
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        pass
+
+    print(f"[COORDINATOR] Starting coordinator daemon for job '{args.job_id}' (PID: {os.getpid()})...", flush=True)
+    print(f"[COORDINATOR] Central storage: {storage_path}", flush=True)
+
+    def _on_round_progress(metrics: dict[str, Any]) -> None:
+        m_type = metrics.get("type")
+        if m_type == "round_completed":
+            r_num = int(metrics.get("round", 0)) + 1
+            max_r = int(metrics.get("max_rounds", 0))
+            loss = float(metrics.get("global_loss", 0.0))
+            spd = float(metrics.get("aggregate_tokens_per_sec", 0.0))
+            print(f"[COORDINATOR] >>> Round {r_num}/{max_r} Averaged! Global Loss: {loss:.4f} | Speed: {spd:,.0f} tok/s", flush=True)
+        elif m_type == "round_waiting":
+            r_num = int(metrics.get("round", 0)) + 1
+            ready = int(metrics.get("ready_workers", 0))
+            total = int(metrics.get("total_participants", 1))
+            elapsed = float(metrics.get("elapsed_seconds", 0.0))
+            if int(elapsed) % 10 == 0:
+                print(f"[COORDINATOR] Waiting for round {r_num} weights ({ready}/{total} workers ready, {elapsed:.0f}s)...", flush=True)
+
+    try:
+        success = coordinator.run_job(
+            poll_interval_seconds=args.poll_interval,
+            telemetry_callback=_on_round_progress,
+        )
+    finally:
+        try:
+            if pid_file.exists():
+                pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    print(f"[COORDINATOR] Coordinator execution finished: success={success}", flush=True)
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

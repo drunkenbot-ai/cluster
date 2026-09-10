@@ -381,7 +381,7 @@ class ClusterStorageBus:
             conn.execute("UPDATE jobs SET updated_at = ? WHERE job_id = ?;", (now, job_id))
         self._run_with_retry(_op, silent=True)
 
-    def get_active_job(self, max_stale_seconds: float = 60.0) -> Optional[dict[str, Any]]:
+    def get_active_job(self, max_stale_seconds: float = 3600.0) -> Optional[dict[str, Any]]:
         """Get the currently active or queued job, automatically sweeping stale uncoordinated jobs."""
         now = time.time()
         def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
@@ -424,10 +424,16 @@ class ClusterStorageBus:
 
         if status == "PAUSED":
             (signals_dir / "pause.sig").touch()
+            stop_sig = signals_dir / "stop.sig"
+            if stop_sig.exists():
+                stop_sig.unlink(missing_ok=True)
         elif status == "RUNNING":
             pause_sig = signals_dir / "pause.sig"
             if pause_sig.exists():
-                pause_sig.unlink()
+                pause_sig.unlink(missing_ok=True)
+            stop_sig = signals_dir / "stop.sig"
+            if stop_sig.exists():
+                stop_sig.unlink(missing_ok=True)
         elif status in {"STOPPING", "STOPPED", "FAILED", "COMPLETED"}:
             (signals_dir / "stop.sig").touch()
 
@@ -440,6 +446,119 @@ class ClusterStorageBus:
                 (new_round, now, job_id),
             )
         self._run_with_retry(_op)
+
+    def list_all_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Retrieve all jobs ordered by created_at DESC."""
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            cursor = conn.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?;",
+                (limit,),
+            )
+            rows = []
+            for r in cursor.fetchall():
+                d = dict(r)
+                try:
+                    d["model_config"] = json.loads(d["model_config"])
+                except Exception:
+                    d["model_config"] = {}
+                try:
+                    d["training_config"] = json.loads(d["training_config"])
+                except Exception:
+                    d["training_config"] = {}
+                rows.append(d)
+            return rows
+        return self._run_with_retry(_op, default_on_error=[])
+
+    def get_job_tasks(self, job_id: str) -> list[dict[str, Any]]:
+        """Retrieve detailed tasks/shards and worker allocations for a job."""
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            cursor = conn.execute(
+                """
+                SELECT p.job_id, p.worker_id, p.shard_index, p.total_shards,
+                       p.last_synced_round, p.status as participant_status,
+                       w.hostname, w.gpu_name, w.status as worker_status,
+                       w.vram_used_gb, w.vram_gb, w.cpu_percent
+                FROM job_participants p
+                LEFT JOIN workers w ON p.worker_id = w.worker_id
+                WHERE p.job_id = ?
+                ORDER BY p.shard_index ASC;
+                """,
+                (job_id,),
+            )
+            rows = []
+            for r in cursor.fetchall():
+                task = dict(r)
+                round_num = task.get("last_synced_round", 0)
+                round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
+                telem_file = round_dir / f"{task['worker_id']}_telemetry.json"
+                if telem_file.exists():
+                    try:
+                        task["telemetry"] = json.loads(telem_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        task["telemetry"] = {}
+                else:
+                    task["telemetry"] = {}
+                rows.append(task)
+            return rows
+        return self._run_with_retry(_op, default_on_error=[])
+
+    def requeue_job(self, job_id: str, reset_rounds: bool = False) -> bool:
+        """Re-queue an existing job to allow resuming or re-running."""
+        now = time.time()
+        def _op(conn: sqlite3.Connection) -> bool:
+            if reset_rounds:
+                conn.execute(
+                    "UPDATE jobs SET status = 'QUEUED', current_round = 0, updated_at = ? WHERE job_id = ?;",
+                    (now, job_id),
+                )
+                conn.execute(
+                    "UPDATE job_participants SET last_synced_round = 0 WHERE job_id = ?;",
+                    (job_id,),
+                )
+                conn.execute("DELETE FROM round_history WHERE job_id = ?;", (job_id,))
+            else:
+                conn.execute(
+                    "UPDATE jobs SET status = 'QUEUED', updated_at = ? WHERE job_id = ?;",
+                    (now, job_id),
+                )
+            return True
+        success = bool(self._run_with_retry(_op, default_on_error=False))
+        if success:
+            signals_dir = self.jobs_dir / job_id / "signals"
+            for sig in ["stop.sig", "pause.sig"]:
+                p = signals_dir / sig
+                if p.exists():
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+            if reset_rounds:
+                rounds_dir = self.jobs_dir / job_id / "rounds"
+                if rounds_dir.exists():
+                    try:
+                        import shutil
+                        shutil.rmtree(rounds_dir, ignore_errors=True)
+                        rounds_dir.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+        return success
+
+    def delete_job(self, job_id: str) -> bool:
+        """Delete a job record and its artifacts from shared storage."""
+        def _op(conn: sqlite3.Connection) -> bool:
+            conn.execute("DELETE FROM jobs WHERE job_id = ?;", (job_id,))
+            conn.execute("DELETE FROM job_participants WHERE job_id = ?;", (job_id,))
+            conn.execute("DELETE FROM round_history WHERE job_id = ?;", (job_id,))
+            return True
+        success = bool(self._run_with_retry(_op, default_on_error=False))
+        job_dir = self.jobs_dir / job_id
+        if job_dir.exists():
+            try:
+                import shutil
+                shutil.rmtree(job_dir, ignore_errors=True)
+            except Exception:
+                pass
+        return success
 
     # -------------------------------------------------------------------------
     # Signals (Fast Local Check without DB query)
@@ -650,6 +769,29 @@ class ClusterStorageBus:
                 rows.append(d)
             return rows
         return self._run_with_retry(_op, default_on_error=[])
+
+    def get_latest_rounds_for_all_jobs(self) -> dict[str, dict[str, Any]]:
+        """Fetch the latest recorded round history summary for each job in a single fast query."""
+        def _op(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+            cursor = conn.execute("""
+                SELECT rh.job_id, rh.round_number, rh.avg_loss, rh.metrics
+                FROM round_history rh
+                INNER JOIN (
+                    SELECT job_id, MAX(round_number) AS max_rnd
+                    FROM round_history
+                    GROUP BY job_id
+                ) latest ON rh.job_id = latest.job_id AND rh.round_number = latest.max_rnd;
+            """)
+            result = {}
+            for r in cursor.fetchall():
+                d = dict(r)
+                try:
+                    d["metrics"] = json.loads(d["metrics"]) if d.get("metrics") else {}
+                except Exception:
+                    d["metrics"] = {}
+                result[d["job_id"]] = d
+            return result
+        return self._run_with_retry(_op, default_on_error={})
 
     # -------------------------------------------------------------------------
     # Binary Tensor Checkpoint Exchange (Atomic Save / Load)
