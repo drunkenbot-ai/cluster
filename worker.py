@@ -10,7 +10,9 @@ Runs as a lightweight headless service on worker compute nodes:
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import platform
 import socket
 import threading
@@ -231,6 +233,10 @@ class ClusterWorker:
                 batch = next(dataloader_iter)
 
             x, y = batch
+            if hasattr(model, "token_embedding") and hasattr(model.token_embedding, "num_embeddings"):
+                n_emb = model.token_embedding.num_embeddings
+                x = torch.clamp(x, 0, n_emb - 1)
+                y = torch.clamp(y, 0, n_emb - 1)
             x = x.to(self.device_str, non_blocking=True)
             y = y.to(self.device_str, non_blocking=True)
 
@@ -308,17 +314,65 @@ class ClusterWorker:
 
                 token_array = np.load(dataset_path, mmap_mode="r")
                 vocab_size = int(model_config.get("vocab_size", 0) or 0)
-                sample_slice = token_array[:min(len(token_array), 100000)]
-                max_token_id = int(np.max(sample_slice)) if len(sample_slice) > 0 else 0
 
-                if vocab_size <= 1 or max_token_id >= vocab_size:
-                    adjusted_vocab = max(max_token_id + 1, 256)
+                # 1. Inspect metadata files if present on shared storage or dataset dir
+                detected_vocab = 0
+                for sdir in [Path(dataset_path).parent, self.bus.shared_dir]:
+                    summary_file = sdir / "dataset_summary.json"
+                    if summary_file.exists():
+                        try:
+                            import json
+                            meta = json.loads(summary_file.read_text(encoding="utf-8"))
+                            detected_vocab = int(meta.get("tokenizer_vocab_size", 0) or 0)
+                            if detected_vocab > 0:
+                                break
+                        except Exception:
+                            pass
+                    tok_file = sdir / "tokenizer.json"
+                    if tok_file.exists() and detected_vocab <= 0:
+                        try:
+                            import json
+                            tok_data = json.loads(tok_file.read_text(encoding="utf-8"))
+                            vocab_dict = tok_data.get("model", {}).get("vocab", {})
+                            if vocab_dict:
+                                detected_vocab = len(vocab_dict)
+                                break
+                        except Exception:
+                            pass
+
+                # 2. Inspect dataset tokens for true maximum token ID
+                max_token_id = 0
+                try:
+                    arr_len = len(token_array)
+                    if arr_len <= 10_000_000:
+                        max_token_id = int(np.max(token_array))
+                    else:
+                        slices = [
+                            token_array[:200000],
+                            token_array[arr_len // 4 : (arr_len // 4) + 200000],
+                            token_array[arr_len // 2 : (arr_len // 2) + 200000],
+                            token_array[(3 * arr_len) // 4 : ((3 * arr_len) // 4) + 200000],
+                            token_array[-200000:],
+                        ]
+                        max_token_id = max(int(np.max(s)) for s in slices if len(s) > 0)
+                except Exception:
+                    max_token_id = 0
+
+                # 3. Determine safe aligned vocab_size
+                min_safe_vocab = 256
+                if max_token_id > 0:
+                    min_safe_vocab = ((max_token_id + 1 + 255) // 256) * 256
+                    if 31000 <= max_token_id < 32000:
+                        min_safe_vocab = max(min_safe_vocab, 32000)
+
+                target_vocab = max(vocab_size, detected_vocab, min_safe_vocab)
+                if vocab_size < target_vocab:
                     self.log(
-                        f"Model vocab_size ({vocab_size}) is invalid or smaller than dataset token ID ({max_token_id}). "
-                        f"Auto-adjusting vocab_size to {adjusted_vocab}.",
+                        f"Model vocab_size ({vocab_size}) is smaller than required ({target_vocab}, detected: {detected_vocab}, max token: {max_token_id}). "
+                        f"Auto-adjusting vocab_size to {target_vocab}.",
                         level="WARNING",
                     )
-                    vocab_size = adjusted_vocab
+                    vocab_size = target_vocab
                     model_config["vocab_size"] = vocab_size
 
                 dataset = ShardedTokenDataset(
