@@ -117,7 +117,7 @@ def ensure_dependencies() -> None:
         print(f"[ClusterWorker] Preparing environment (missing={missing}, need_cuda={need_cuda_torch})...")
 
         # 1. Check for offline wheels cache in shared directory
-        shared_dir_env = os.environ.get("LLM_SHARED_DIR", "")
+        shared_dir_env = os.environ.get("LLM_SHARED_PATH") or os.environ.get("LLM_SHARED_DIR", "")
         shared_wheels = Path(shared_dir_env) / "wheels" if shared_dir_env else None
         installed_offline = False
 
@@ -410,6 +410,16 @@ class StandaloneStorageBus:
                     PRIMARY KEY (job_id, worker_id)
                 );
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    worker_id TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    level TEXT DEFAULT 'INFO',
+                    message TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
 
     def register_worker(self, worker_id: str, hostname: str, gpu_name: str, vram_gb: float) -> None:
         now = time.time()
@@ -438,7 +448,7 @@ class StandaloneStorageBus:
             ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
             ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
             vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
-            metrics_str = json.dumps(metrics) if metrics else None
+            metrics_str = json.dumps(metrics, default=str) if metrics else None
 
             if status is not None and metrics is not None:
                 conn.execute("""
@@ -576,7 +586,7 @@ class StandaloneStorageBus:
         round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         target = round_dir / f"{worker_id}_telemetry.json"
-        target.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+        target.write_text(json.dumps(telemetry, indent=2, default=str), encoding="utf-8")
 
     def load_worker_telemetry(self, job_id: str, round_num: int, worker_id: str) -> Optional[dict[str, Any]]:
         target = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / f"{worker_id}_telemetry.json"
@@ -652,6 +662,27 @@ class StandaloneStorageBus:
         if final.exists():
             return torch.load(final, map_location=device)
         return None
+
+    def write_worker_logs(self, entries: list[tuple[str, float, str, str]]) -> None:
+        if not entries:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO worker_logs (worker_id, timestamp, level, message) VALUES (?, ?, ?, ?);",
+                entries,
+            )
+
+    def write_worker_log(self, worker_id: str, message: str, level: str = "INFO") -> None:
+        self.write_worker_logs([(worker_id, time.time(), level, message)])
+
+    def get_worker_logs(self, worker_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT id, worker_id, timestamp, level, message FROM worker_logs WHERE worker_id = ? ORDER BY id DESC LIMIT ?;",
+                (worker_id, limit),
+            )
+            rows = cursor.fetchall()
+        return [dict(r) for r in reversed(rows)]
 
 
 # =============================================================================
@@ -984,28 +1015,36 @@ class StandaloneWorker:
 
         self.bus.register_worker(self.worker_id, self.hostname, self.gpu_name, self.vram_gb)
 
+    def log(self, message: str, level: str = "INFO") -> None:
+        """Write diagnostic log to stdout and central SQLite worker_logs table."""
+        timestamp_str = time.strftime("%H:%M:%S")
+        print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {message}", flush=True)
+        try:
+            self.bus.write_worker_log(self.worker_id, message, level=level)
+        except Exception:
+            pass
+
     def _heartbeat(self, status: Optional[str] = None, current_job_id: Optional[str] = None) -> None:
         metrics = collect_system_metrics(self.device_str, self.vram_gb)
         self.bus.heartbeat(self.worker_id, status=status, current_job_id=current_job_id, metrics=metrics)
 
     def run(self, poll_interval: float = 3.0) -> None:
         """Main worker loop: registers heartbeat, claims jobs, and trains across rounds."""
-        print(f"[ClusterWorker] Node: {self.worker_id}")
-        print(f"[ClusterWorker] Host: {self.hostname} | Device: {self.device_str} ({self.gpu_name}, {self.vram_gb} GB VRAM)")
-        print(f"[ClusterWorker] Central Storage: {self.bus.shared_dir.resolve()}")
-        print(f"[ClusterWorker] Running as process PID: {os.getpid()} (Device Tag: {self.device_tag})")
-        print("[ClusterWorker] Waiting for cluster jobs...")
+        self.log(f"Node online: {self.worker_id}")
+        self.log(f"Host: {self.hostname} | Device: {self.device_str} ({self.gpu_name}, {self.vram_gb} GB VRAM)")
+        self.log(f"Central Storage: {self.bus.shared_dir.resolve()} | PID: {os.getpid()} ({self.device_tag})")
+        self.log("Waiting for cluster jobs...")
 
         while True:
             cmd = self.bus.get_worker_command(self.worker_id)
             if cmd == "STOP":
-                print(f"[ClusterWorker] Received STOP command for {self.worker_id}. Shutting down...")
+                self.log(f"Received STOP command. Shutting down...")
                 self.bus.set_worker_command(self.worker_id, None)
                 self._heartbeat(status="OFFLINE", current_job_id=None)
                 release_singleton_lock(self.device_tag)
                 sys.exit(0)
             elif cmd == "RESTART":
-                print(f"[ClusterWorker] Received RESTART command for {self.worker_id}. Resetting...")
+                self.log(f"Received RESTART command. Resetting...")
                 self.bus.set_worker_command(self.worker_id, None)
                 self._heartbeat(status="IDLE", current_job_id=None)
                 time.sleep(1.0)
@@ -1020,24 +1059,37 @@ class StandaloneWorker:
 
     def _execute_job(self, job: dict[str, Any], poll_interval: float = 2.0) -> None:
         job_id = job["job_id"]
-        print(f"[ClusterWorker] >>> Claiming job: {job_id}")
+        self.log(f">>> Claimed job: {job_id}")
+        self._heartbeat(status="PREPARING", current_job_id=job_id)
 
-        shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
-        print(f"[ClusterWorker] Assigned data shard: {shard_idx} of {total_shards} total nodes")
+        try:
+            shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
+            self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
 
-        dataset_path = job.get("dataset_path", "")
-        if not os.path.exists(dataset_path):
-            print(f"[ClusterWorker] Dataset not found at: {dataset_path}")
+            dataset_path = job.get("dataset_path", "")
+            if not os.path.exists(dataset_path):
+                err = f"Dataset not found at: {dataset_path}"
+                self.log(err, level="ERROR")
+                self._heartbeat(status="ERROR", current_job_id=job_id)
+                return
+
+            token_array = np.load(dataset_path, mmap_mode="r")
+            context_length = int(job.get("model_config", {}).get("context_length", 512))
+            dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards)
+            batch_size = int(job.get("training_config", {}).get("batch_size", 4))
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataloader_iter = iter(dataloader)
+
+            model = build_worker_model(job.get("model_config", {}), self.device_str)
+            lr = float(job.get("training_config", {}).get("learning_rate", 3e-4))
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+            self.log(f"Initialized model for {self.worker_id} on {self.device_str}. Ready to train.")
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"Preparation failed for job {job_id}:\n{tb}", level="ERROR")
+            self._heartbeat(status="ERROR", current_job_id=job_id)
             return
-
-        token_array = np.load(dataset_path, mmap_mode="r")
-        context_length = int(job.get("model_config", {}).get("context_length", 512))
-        dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards)
-        batch_size = int(job.get("training_config", {}).get("batch_size", 4))
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        dataloader_iter = iter(dataloader)
-
-        model = build_worker_model(job.get("model_config", {}), self.device_str)
         lr = float(job.get("training_config", {}).get("learning_rate", 3e-4))
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
@@ -1180,7 +1232,7 @@ def main() -> int:
     parser.add_argument("--detach", "--background", action="store_true", help="Launch worker in the background detached from this terminal")
     args = parser.parse_args()
 
-    shared_dir = args.shared_dir or os.environ.get("LLM_SHARED_DIR")
+    shared_dir = args.shared_dir or os.environ.get("LLM_SHARED_PATH") or os.environ.get("LLM_SHARED_DIR")
 
     if args.stop:
         device_tag = get_device_tag(args.device) if args.device else None

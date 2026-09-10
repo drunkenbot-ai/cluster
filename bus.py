@@ -125,10 +125,16 @@ class ClusterStorageBus:
                     PRIMARY KEY (job_id, round_number)
                 );
             """)
-            try:
-                conn.execute("ALTER TABLE round_history ADD COLUMN metrics TEXT;")
-            except Exception:
-                pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS worker_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    worker_id TEXT NOT NULL,
+                    timestamp REAL NOT NULL,
+                    level TEXT DEFAULT 'INFO',
+                    message TEXT NOT NULL
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
 
     # -------------------------------------------------------------------------
     # Worker Lifecycle & Heartbeats
@@ -169,7 +175,7 @@ class ClusterStorageBus:
             ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
             ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
             vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
-            metrics_str = json.dumps(metrics) if metrics else None
+            metrics_str = json.dumps(metrics, default=str) if metrics else None
 
             if status is not None and metrics is not None:
                 conn.execute("""
@@ -284,9 +290,9 @@ class ClusterStorageBus:
                 VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?);
             """, (
                 job_id,
-                json.dumps(model_config),
-                json.dumps(training_config),
-                dataset_path,
+                json.dumps(model_config, default=str),
+                json.dumps(training_config, default=str),
+                str(dataset_path),
                 max_rounds,
                 sync_interval_steps,
                 min_workers,
@@ -500,7 +506,7 @@ class ClusterStorageBus:
         round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         target = round_dir / f"{worker_id}_telemetry.json"
-        target.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+        target.write_text(json.dumps(telemetry, indent=2, default=str), encoding="utf-8")
         return target
 
     def load_worker_telemetry(
@@ -535,10 +541,10 @@ class ClusterStorageBus:
             """, (
                 job_id,
                 round_num,
-                json.dumps(participating_workers),
+                json.dumps(participating_workers, default=str),
                 now,
                 avg_loss,
-                json.dumps(metrics),
+                json.dumps(metrics, default=str),
             ))
 
     def get_all_round_history(self, job_id: str) -> list[dict[str, Any]]:
@@ -690,3 +696,36 @@ class ClusterStorageBus:
         if final.exists():
             return torch.load(final, map_location=device)
         return None
+
+    # -------------------------------------------------------------------------
+    # Worker Logging to SQLite
+    # -------------------------------------------------------------------------
+
+    def write_worker_logs(self, entries: list[tuple[str, float, str, str]]) -> None:
+        """Batch write worker log messages into SQLite bus.
+
+        Args:
+            entries: List of (worker_id, timestamp, level, message) tuples.
+        """
+        if not entries:
+            return
+        with self._connect() as conn:
+            conn.executemany(
+                "INSERT INTO worker_logs (worker_id, timestamp, level, message) VALUES (?, ?, ?, ?);",
+                entries,
+            )
+
+    def write_worker_log(self, worker_id: str, message: str, level: str = "INFO") -> None:
+        """Write a single worker log message."""
+        self.write_worker_logs([(worker_id, time.time(), level, message)])
+
+    def get_worker_logs(self, worker_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Retrieve recent diagnostic logs for a specific worker node."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "SELECT id, worker_id, timestamp, level, message FROM worker_logs WHERE worker_id = ? ORDER BY id DESC LIMIT ?;",
+                (worker_id, limit),
+            )
+            rows = cursor.fetchall()
+        return [dict(r) for r in reversed(rows)]
+

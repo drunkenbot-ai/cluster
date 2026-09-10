@@ -112,6 +112,7 @@ class ClusterCoordinator:
 
             if progress_callback:
                 progress_callback({
+                    "type": "round_waiting",
                     "round": round_num,
                     "ready_workers": len(ready_workers),
                     "total_participants": total_participants,
@@ -202,6 +203,7 @@ class ClusterCoordinator:
 
         # Report round completion to progress callback
         if progress_callback:
+            summary_metrics["type"] = "round_completed"
             progress_callback(summary_metrics)
 
         return global_state

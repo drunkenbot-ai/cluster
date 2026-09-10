@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -179,12 +180,13 @@ def cmd_resume(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    default_shared = os.environ.get("LLM_SHARED_PATH") or os.environ.get("LLM_SHARED_DIR")
     parser = argparse.ArgumentParser(prog="cluster", description="Distributed Port-Blocked Training Cluster CLI")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     # Worker subcommand
     p_worker = subparsers.add_parser("worker", help="Run a worker daemon")
-    p_worker.add_argument("--shared-dir", required=True, help="Shared network directory")
+    p_worker.add_argument("--shared-dir", default=default_shared, required=default_shared is None, help="Shared network directory (or set LLM_SHARED_PATH)")
     p_worker.add_argument("--worker-id", default=None, help="Custom worker ID")
     p_worker.add_argument("--device", default=None, help="Device to use (e.g. 'cuda:0', 'cpu')")
     p_worker.add_argument("--heartbeat-interval", type=float, default=5.0, help="Heartbeat interval in seconds")
@@ -194,7 +196,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Status subcommand
     p_status = subparsers.add_parser("status", help="Show cluster status")
-    p_status.add_argument("--shared-dir", required=True, help="Shared network directory")
+    p_status.add_argument("--shared-dir", default=default_shared, required=default_shared is None, help="Shared network directory (or set LLM_SHARED_PATH)")
     p_status.add_argument("--heartbeat-timeout", type=float, default=45.0, help="Seconds before marking worker offline")
     p_status.set_defaults(func=cmd_status)
 

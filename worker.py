@@ -148,6 +148,15 @@ class ClusterWorker:
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._hb_thread.start()
 
+    def log(self, message: str, level: str = "INFO") -> None:
+        """Write diagnostic log to stdout and central SQLite worker_logs table."""
+        timestamp_str = time.strftime("%H:%M:%S")
+        print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {message}", flush=True)
+        try:
+            self.bus.write_worker_log(self.worker_id, message, level=level)
+        except Exception:
+            pass
+
     def _heartbeat_loop(self) -> None:
         """Background thread updating heartbeat periodically."""
         while not self._stop_event.is_set():
@@ -266,6 +275,7 @@ class ClusterWorker:
         job_id = job["job_id"]
         self._current_job_id = job_id
         self._current_status = "PREPARING"
+        self.log(f">>> Claimed job: {job_id}")
 
         model_config = job.get("model_config", {})
         training_config = job.get("training_config", {})
@@ -276,32 +286,45 @@ class ClusterWorker:
         lr = float(training_config.get("learning_rate", 3e-4))
         context_length = int(model_config.get("context_length", 512))
 
-        # Claim data shard slot
-        shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
+        try:
+            # Claim data shard slot
+            shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
+            self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
 
-        # Prepare dataset
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(f"Dataset path not found on shared storage: {dataset_path}")
+            # Prepare dataset
+            if not os.path.exists(dataset_path):
+                err = f"Dataset path not found on shared storage: {dataset_path}"
+                self.log(err, level="ERROR")
+                self._current_status = "ERROR"
+                return False
 
-        token_array = np.load(dataset_path, mmap_mode="r")
-        dataset = ShardedTokenDataset(
-            token_array=token_array,
-            context_length=context_length,
-            shard_index=shard_idx,
-            total_shards=total_shards,
-        )
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        dataloader_iter = iter(dataloader)
+            token_array = np.load(dataset_path, mmap_mode="r")
+            dataset = ShardedTokenDataset(
+                token_array=token_array,
+                context_length=context_length,
+                shard_index=shard_idx,
+                total_shards=total_shards,
+            )
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataloader_iter = iter(dataloader)
 
-        # Build model and optimizer
-        model = build_model_from_config(model_config, self.device_str)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+            # Build model and optimizer
+            model = build_model_from_config(model_config, self.device_str)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+            self.log(f"Model initialized on device '{self.device_str}'. Ready to train {max_rounds} rounds.")
+        except Exception as exc:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"Preparation failed for job {job_id}:\n{tb}", level="ERROR")
+            self._current_status = "ERROR"
+            return False
 
         current_round = int(job.get("current_round", 0))
 
         while current_round < max_rounds and not self._stop_event.is_set():
             if self.bus.is_stopped(job_id):
                 self._current_status = "STOPPED"
+                self.log(f"Job {job_id} stopped.")
                 return False
 
             # If round > 0, wait for and synchronize from previous global averaged model
@@ -318,16 +341,26 @@ class ClusterWorker:
                 model.load_state_dict(global_state)
 
             # Train locally for K steps
-            avg_loss, dataloader_iter = self.run_training_round(
-                job_id=job_id,
-                round_num=current_round,
-                model=model,
-                optimizer=optimizer,
-                dataloader=dataloader,
-                dataloader_iter=dataloader_iter,
-                steps_per_round=sync_interval_steps,
-                log_callback=log_callback,
-            )
+            self._current_status = "TRAINING"
+            self.log(f"Starting training round {current_round + 1}/{max_rounds} ({sync_interval_steps} local steps)...")
+            try:
+                avg_loss, dataloader_iter = self.run_training_round(
+                    job_id=job_id,
+                    round_num=current_round,
+                    model=model,
+                    optimizer=optimizer,
+                    dataloader=dataloader,
+                    dataloader_iter=dataloader_iter,
+                    steps_per_round=sync_interval_steps,
+                    log_callback=log_callback,
+                )
+                self.log(f"Round {current_round + 1}/{max_rounds} completed. Avg loss: {avg_loss:.4f}. Depositing weights...")
+            except Exception as exc:
+                import traceback
+                tb = traceback.format_exc()
+                self.log(f"Training round {current_round} crashed:\n{tb}", level="ERROR")
+                self._current_status = "ERROR"
+                return False
 
             # Atomically deposit local worker weights
             self.bus.save_worker_weights(
@@ -349,10 +382,12 @@ class ClusterWorker:
 
         self._current_status = "COMPLETED"
         self._current_job_id = None
+        self.log(f"Job {job_id} successfully completed all {max_rounds} rounds.")
         return True
 
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""
+        self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         while not self._stop_event.is_set():
             self._current_status = "IDLE"
             self._current_job_id = None
@@ -362,6 +397,11 @@ class ClusterWorker:
                 if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
                     self.execute_job(active_job, poll_interval=poll_interval)
             except Exception as exc:
-                print(f"[Worker {self.worker_id}] Error in worker daemon: {exc}")
+                import traceback
+                tb = traceback.format_exc()
+                self.log(f"Error in worker daemon:\n{tb}", level="ERROR")
+                time.sleep(poll_interval * 2)
+
+            self._stop_event.wait(poll_interval)
 
             self._stop_event.wait(poll_interval)
