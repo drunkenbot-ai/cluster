@@ -169,7 +169,7 @@ class ClusterStorageBus:
             ram_used = float(metrics.get("ram_used_gb", 0.0)) if metrics and "ram_used_gb" in metrics else None
             ram_tot = float(metrics.get("ram_total_gb", 0.0)) if metrics and "ram_total_gb" in metrics else None
             vram_used = float(metrics.get("vram_used_gb", 0.0)) if metrics and "vram_used_gb" in metrics else None
-            metrics_str = json.dumps(metrics) if metrics else None
+            metrics_str = json.dumps(metrics, default=str) if metrics else None
 
             if status is not None and metrics is not None:
                 conn.execute("""
@@ -284,9 +284,9 @@ class ClusterStorageBus:
                 VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?);
             """, (
                 job_id,
-                json.dumps(model_config),
-                json.dumps(training_config),
-                dataset_path,
+                json.dumps(model_config, default=str),
+                json.dumps(training_config, default=str),
+                str(dataset_path),
                 max_rounds,
                 sync_interval_steps,
                 min_workers,
@@ -500,7 +500,7 @@ class ClusterStorageBus:
         round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
         round_dir.mkdir(parents=True, exist_ok=True)
         target = round_dir / f"{worker_id}_telemetry.json"
-        target.write_text(json.dumps(telemetry, indent=2), encoding="utf-8")
+        target.write_text(json.dumps(telemetry, indent=2, default=str), encoding="utf-8")
         return target
 
     def load_worker_telemetry(
@@ -535,10 +535,10 @@ class ClusterStorageBus:
             """, (
                 job_id,
                 round_num,
-                json.dumps(participating_workers),
+                json.dumps(participating_workers, default=str),
                 now,
                 avg_loss,
-                json.dumps(metrics),
+                json.dumps(metrics, default=str),
             ))
 
     def get_all_round_history(self, job_id: str) -> list[dict[str, Any]]:
