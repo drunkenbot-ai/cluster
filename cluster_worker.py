@@ -1449,12 +1449,18 @@ class StandaloneWorker:
                         logits = model(x)
                         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
+                    max_grad = float(training_cfg.get("max_gradient") or training_cfg.get("max_grad") or 1.0)
                     if scaler is not None:
                         scaler.scale(loss).backward()
+                        if max_grad > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
                         scaler.step(optimizer)
                         scaler.update()
                     else:
                         loss.backward()
+                        if max_grad > 0:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
                         optimizer.step()
 
                     step_losses.append(float(loss.item()))
