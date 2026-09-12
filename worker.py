@@ -403,67 +403,50 @@ class ClusterWorker:
                     self._current_status = "ERROR"
                     return False
 
+                self.log(f"Mapping dataset: {dataset_path}...")
                 token_array = np.load(dataset_path, mmap_mode="r")
                 vocab_size = int(model_config.get("vocab_size", 0) or 0)
 
-                # 1. Inspect metadata files if present on shared storage or dataset dir
-                detected_vocab = 0
-                for sdir in [Path(dataset_path).parent, self.bus.shared_dir]:
-                    summary_file = sdir / "dataset_summary.json"
-                    if summary_file.exists():
-                        try:
-                            import json
-                            meta = json.loads(summary_file.read_text(encoding="utf-8"))
-                            detected_vocab = int(meta.get("tokenizer_vocab_size", 0) or 0)
-                            if detected_vocab > 0:
-                                break
-                        except Exception:
-                            pass
-                    tok_file = sdir / "tokenizer.json"
-                    if tok_file.exists() and detected_vocab <= 0:
-                        try:
-                            import json
-                            tok_data = json.loads(tok_file.read_text(encoding="utf-8"))
-                            vocab_dict = tok_data.get("model", {}).get("vocab", {})
-                            if vocab_dict:
-                                detected_vocab = len(vocab_dict)
-                                break
-                        except Exception:
-                            pass
+                if vocab_size <= 0:
+                    detected_vocab = 0
+                    for sdir in [Path(dataset_path).parent, self.bus.shared_dir]:
+                        summary_file = sdir / "dataset_summary.json"
+                        if summary_file.exists():
+                            try:
+                                import json
+                                meta = json.loads(summary_file.read_text(encoding="utf-8"))
+                                detected_vocab = int(meta.get("tokenizer_vocab_size", 0) or 0)
+                                if detected_vocab > 0:
+                                    break
+                            except Exception:
+                                pass
+                        tok_file = sdir / "tokenizer.json"
+                        if tok_file.exists() and detected_vocab <= 0:
+                            try:
+                                import json
+                                tok_data = json.loads(tok_file.read_text(encoding="utf-8"))
+                                vocab_dict = tok_data.get("model", {}).get("vocab", {})
+                                if vocab_dict:
+                                    detected_vocab = len(vocab_dict)
+                                    break
+                            except Exception:
+                                pass
 
-                # 2. Inspect dataset tokens for true maximum token ID
-                max_token_id = 0
-                try:
-                    arr_len = len(token_array)
-                    if arr_len <= 10_000_000:
-                        max_token_id = int(np.max(token_array))
-                    else:
-                        slices = [
-                            token_array[:200000],
-                            token_array[arr_len // 4 : (arr_len // 4) + 200000],
-                            token_array[arr_len // 2 : (arr_len // 2) + 200000],
-                            token_array[(3 * arr_len) // 4 : ((3 * arr_len) // 4) + 200000],
-                            token_array[-200000:],
-                        ]
-                        max_token_id = max(int(np.max(s)) for s in slices if len(s) > 0)
-                except Exception:
                     max_token_id = 0
+                    if detected_vocab <= 0:
+                        try:
+                            sample = token_array[:50000]
+                            max_token_id = int(np.max(sample)) if len(sample) > 0 else 0
+                        except Exception:
+                            max_token_id = 0
 
-                # 3. Determine safe aligned vocab_size
-                min_safe_vocab = 256
-                if max_token_id > 0:
-                    min_safe_vocab = ((max_token_id + 1 + 255) // 256) * 256
-                    if 31000 <= max_token_id < 32000:
-                        min_safe_vocab = max(min_safe_vocab, 32000)
+                    min_safe_vocab = 256
+                    if max_token_id > 0:
+                        min_safe_vocab = ((max_token_id + 1 + 255) // 256) * 256
+                        if 31000 <= max_token_id < 32000:
+                            min_safe_vocab = max(min_safe_vocab, 32000)
 
-                target_vocab = max(vocab_size, detected_vocab, min_safe_vocab)
-                if vocab_size < target_vocab:
-                    self.log(
-                        f"Model vocab_size ({vocab_size}) is smaller than required ({target_vocab}, detected: {detected_vocab}, max token: {max_token_id}). "
-                        f"Auto-adjusting vocab_size to {target_vocab}.",
-                        level="WARNING",
-                    )
-                    vocab_size = target_vocab
+                    vocab_size = max(detected_vocab, min_safe_vocab, 256)
                     model_config["vocab_size"] = vocab_size
 
                 dataset = ShardedTokenDataset(
@@ -477,6 +460,7 @@ class ClusterWorker:
                 dataloader_iter = iter(dataloader)
 
                 # Build model and optimizer
+                self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Initializing model on {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str)
                 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
                 self.log(f"Model initialized on device '{self.device_str}'. Ready to train {max_rounds} rounds.")
@@ -494,6 +478,26 @@ class ClusterWorker:
                     self._current_status = "STOPPED"
                     self.log(f"Job {job_id} stopped.")
                     return False
+
+                # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
+                try:
+                    new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(
+                        job_id, self.worker_id, current_round
+                    )
+                    if new_shard_idx != shard_idx or new_total_shards != total_shards:
+                        self.log(f"Active worker pool updated. Shard reallocated: {new_shard_idx + 1} of {new_total_shards} nodes.")
+                        shard_idx, total_shards = new_shard_idx, new_total_shards
+                        dataset = ShardedTokenDataset(
+                            token_array=token_array,
+                            context_length=context_length,
+                            shard_index=shard_idx,
+                            total_shards=total_shards,
+                            vocab_size=vocab_size,
+                        )
+                        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                        dataloader_iter = iter(dataloader)
+                except Exception:
+                    pass
 
                 # If round > 0, wait for and synchronize from previous global averaged model
                 if current_round > 0:
