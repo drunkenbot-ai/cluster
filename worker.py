@@ -15,6 +15,8 @@ import os
 from pathlib import Path
 import platform
 import socket
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -160,9 +162,57 @@ class ClusterWorker:
             pass
 
     def _heartbeat_loop(self) -> None:
-        """Background thread updating heartbeat periodically."""
+        """Background thread updating heartbeat periodically and listening for STOP/RESTART commands."""
         while not self._stop_event.is_set():
             try:
+                cmd = self.bus.get_worker_command(self.worker_id)
+                if cmd == "STOP":
+                    self.log("Received remote STOP command. Shutting down worker...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._stop_event.set()
+                    self._current_status = "OFFLINE"
+                    try:
+                        self.bus.heartbeat(
+                            worker_id=self.worker_id,
+                            status="OFFLINE",
+                            current_job_id=None,
+                        )
+                    except Exception:
+                        pass
+                    from .cluster_worker import release_singleton_lock, get_device_tag
+                    release_singleton_lock(get_device_tag(self.device_str))
+                    release_singleton_lock(f"wid_{self.worker_id}")
+                    os._exit(0)
+                elif cmd == "RESTART":
+                    self.log("Received remote RESTART command. Respawning worker process...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._stop_event.set()
+                    self._current_status = "OFFLINE"
+                    try:
+                        self.bus.heartbeat(
+                            worker_id=self.worker_id,
+                            status="OFFLINE",
+                            current_job_id=None,
+                        )
+                    except Exception:
+                        pass
+                    from .cluster_worker import release_singleton_lock, get_device_tag
+                    release_singleton_lock(get_device_tag(self.device_str))
+                    release_singleton_lock(f"wid_{self.worker_id}")
+                    time.sleep(0.3)
+                    flags = 0
+                    if sys.platform == "win32":
+                        DETACHED_PROCESS = 0x00000008
+                        CREATE_NEW_PROCESS_GROUP = 0x00000200
+                        CREATE_NO_WINDOW = 0x08000000
+                        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                    subprocess.Popen(
+                        [sys.executable] + sys.argv,
+                        creationflags=flags,
+                        close_fds=True,
+                    )
+                    os._exit(0)
+
                 self.bus.heartbeat(
                     worker_id=self.worker_id,
                     status=self._current_status,

@@ -28,8 +28,17 @@ def cmd_worker(args: argparse.Namespace) -> int:
         get_running_worker_pid,
         is_pid_running,
         release_singleton_lock,
+        stop_running_worker,
     )
     from .worker import get_hardware_info
+
+    if getattr(args, "stop", False):
+        dev_tag = get_device_tag(args.device) if args.device else None
+        return stop_running_worker(dev_tag)
+
+    if not args.shared_dir:
+        print("[Worker] ERROR: --shared-dir is required to start a worker.")
+        return 1
 
     shared_dir = Path(args.shared_dir)
     device_str, _, _ = get_hardware_info(args.device)
@@ -220,7 +229,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     # Worker subcommand
     p_worker = subparsers.add_parser("worker", help="Run a worker daemon")
-    p_worker.add_argument("--shared-dir", default=default_shared, required=default_shared is None, help="Shared network directory (or set LLM_SHARED_PATH)")
+    p_worker.add_argument("--stop", action="store_true", help="Stop running worker process(es) on this machine")
+    p_worker.add_argument("--shared-dir", default=default_shared, required=(default_shared is None and "--stop" not in (argv or sys.argv)), help="Shared network directory (or set LLM_SHARED_PATH)")
     p_worker.add_argument("--worker-id", default=None, help="Custom worker ID")
     p_worker.add_argument("--device", default=None, help="Device to use (e.g. 'cuda:0', 'cpu')")
     p_worker.add_argument("--heartbeat-interval", type=float, default=5.0, help="Heartbeat interval in seconds")
