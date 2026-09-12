@@ -330,7 +330,7 @@ class ClusterStorageBus:
         max_rounds: int = 10,
         sync_interval_steps: int = 250,
         min_workers: int = 1,
-        sync_timeout_seconds: float = 180.0,
+        sync_timeout_seconds: float = 1800.0,
     ) -> None:
         """Create a new distributed training job."""
         now = time.time()

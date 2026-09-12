@@ -437,7 +437,7 @@ class StandaloneStorageBus:
                     max_rounds INTEGER DEFAULT 10,
                     sync_interval_steps INTEGER DEFAULT 250,
                     min_workers INTEGER DEFAULT 1,
-                    sync_timeout_seconds REAL DEFAULT 180.0,
+                    sync_timeout_seconds REAL DEFAULT 1800.0,
                     created_at REAL,
                     updated_at REAL
                 );
@@ -1344,21 +1344,33 @@ class StandaloneWorker:
         sync_steps = int(job.get("sync_interval_steps", 250))
         cur_round = int(job.get("current_round", 0))
 
+        # Mixed precision (AMP) configuration
+        is_cuda = self.device_str.startswith("cuda") and torch.cuda.is_available()
+        precision = str(training_cfg.get("precision", "fp16")).lower()
+        use_amp = bool(training_cfg.get("use_amp", True))
+        amp_enabled = is_cuda and use_amp and (precision in ("fp16", "bf16"))
+        amp_dtype = torch.bfloat16 if (precision == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
+        scaler = None
+        if amp_enabled and amp_dtype == torch.float16:
+            if not hasattr(self, "_scaler") or self._scaler is None:
+                self._scaler = torch.amp.GradScaler('cuda')
+            scaler = self._scaler
+
         try:
             while cur_round < max_rounds:
                 if self.bus.is_stopped(job_id):
-                    print(f"[ClusterWorker] Job {job_id} stopped.")
+                    self.log(f"Job {job_id} stopped.")
                     break
 
                 cmd = self.bus.get_worker_command(self.worker_id)
                 if cmd == "STOP":
-                    print(f"[ClusterWorker] Received STOP command during job {job_id}.")
+                    self.log(f"Received STOP command during job {job_id}.")
                     self.bus.set_worker_command(self.worker_id, None)
                     self._heartbeat(status="OFFLINE", current_job_id=None)
                     release_singleton_lock(self.device_tag)
                     sys.exit(0)
                 elif cmd == "RESTART":
-                    print(f"[ClusterWorker] Received RESTART command during job {job_id}.")
+                    self.log(f"Received RESTART command during job {job_id}.")
                     self._restart_process()
 
                 # Handle cooperative pause
@@ -1371,7 +1383,7 @@ class StandaloneWorker:
                 # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
                 new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
                 if new_shard_idx != shard_idx or new_total_shards != total_shards:
-                    print(f"[ClusterWorker] Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
+                    self.log(f"Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
                     shard_idx, total_shards = new_shard_idx, new_total_shards
                     dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
                     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -1379,7 +1391,7 @@ class StandaloneWorker:
 
                 # Sync from global model if round > 0
                 if cur_round > 0:
-                    print(f"[ClusterWorker] Waiting for global averaged model round {cur_round - 1}...")
+                    self.log(f"Waiting for global averaged model round {cur_round - 1}...")
                     while not self.bus.is_global_weights_ready(job_id, cur_round - 1):
                         if self.bus.is_stopped(job_id):
                             return
@@ -1388,10 +1400,10 @@ class StandaloneWorker:
 
                     global_state = self.bus.load_global_weights(job_id, cur_round - 1, device=self.device_str)
                     model.load_state_dict(global_state)
-                    print(f"[ClusterWorker] Loaded round {cur_round - 1} global weights into {self.device_str}.")
+                    self.log(f"Loaded round {cur_round - 1} global weights into {self.device_str}.")
 
                 # Local SGD training steps
-                print(f"[ClusterWorker] Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str})...")
+                self.log(f"Training round {cur_round}/{max_rounds} ({sync_steps} local steps on {self.device_str}, AMP: {amp_enabled})...")
                 model.train()
                 self._heartbeat(status="TRAINING", current_job_id=job_id)
 
@@ -1429,16 +1441,24 @@ class StandaloneWorker:
                     y = y.to(self.device_str, non_blocking=True)
 
                     optimizer.zero_grad()
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-                    loss.backward()
-                    optimizer.step()
+                    with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                        logits = model(x)
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
+
                     step_losses.append(float(loss.item()))
 
                 elapsed = max(time.time() - start_time, 1e-4)
                 tokens_per_sec = tokens_processed / elapsed
                 avg_loss = sum(step_losses) / max(len(step_losses), 1)
-                print(f"[ClusterWorker] Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
+                self.log(f"Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
 
                 # Save local weights
                 self._heartbeat(status="DEPOSITING", current_job_id=job_id)
@@ -1466,7 +1486,7 @@ class StandaloneWorker:
                 )
 
                 # Wait for coordinator to publish global model
-                print(f"[ClusterWorker] Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
+                self.log(f"Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
                 while not self.bus.is_global_weights_ready(job_id, cur_round):
                     if self.bus.is_stopped(job_id):
                         return
@@ -1476,11 +1496,11 @@ class StandaloneWorker:
                 # Load synchronized global model weights into local model for next round
                 global_weights = self.bus.load_global_weights(job_id, cur_round, device=self.device_str)
                 model.load_state_dict(global_weights)
-                print(f"[ClusterWorker] Successfully loaded averaged global weights for round {cur_round}.")
+                self.log(f"Successfully loaded averaged global weights for round {cur_round}.")
 
                 cur_round += 1
 
-            print(f"[ClusterWorker] Job {job_id} finished. Returning to IDLE.")
+            self.log(f"Job {job_id} finished. Returning to IDLE.")
             self._heartbeat(status="IDLE", current_job_id=None)
         except Exception as exc:
             import traceback

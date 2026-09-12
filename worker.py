@@ -191,6 +191,7 @@ class ClusterWorker:
         dataloader: DataLoader,
         dataloader_iter: Any,
         steps_per_round: int,
+        job: Optional[dict[str, Any]] = None,
         log_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> tuple[float, Any]:
         """Execute K steps of local SGD training for a single round.
@@ -203,6 +204,7 @@ class ClusterWorker:
             dataloader: Sharded token data loader.
             dataloader_iter: Active DataLoader iterator.
             steps_per_round: Local training steps before sync.
+            job: Optional full job configuration dict.
             log_callback: Optional progress reporter.
 
         Returns:
@@ -211,6 +213,22 @@ class ClusterWorker:
         model.train()
         total_loss = 0.0
         steps_done = 0
+        tokens_processed = 0
+        start_time = time.time()
+
+        # Mixed precision (AMP) configuration
+        is_cuda = self.device_str.startswith("cuda") and torch.cuda.is_available()
+        training_cfg = job.get("training_config", {}) if isinstance(job, dict) else {}
+        precision = str(training_cfg.get("precision", "fp16")).lower()
+        use_amp = bool(training_cfg.get("use_amp", True))
+        amp_enabled = is_cuda and use_amp and (precision in ("fp16", "bf16"))
+        amp_dtype = torch.bfloat16 if (precision == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
+
+        scaler = None
+        if amp_enabled and amp_dtype == torch.float16:
+            if not hasattr(self, "_scaler") or self._scaler is None:
+                self._scaler = torch.amp.GradScaler('cuda')
+            scaler = self._scaler
 
         for step in range(steps_per_round):
             if self._stop_event.is_set() or self.bus.is_stopped(job_id):
@@ -233,6 +251,7 @@ class ClusterWorker:
                 batch = next(dataloader_iter)
 
             x, y = batch
+            tokens_processed += int(x.numel())
             if hasattr(model, "token_embedding") and hasattr(model.token_embedding, "num_embeddings"):
                 n_emb = model.token_embedding.num_embeddings
                 x = torch.clamp(x, 0, n_emb - 1)
@@ -241,10 +260,17 @@ class ClusterWorker:
             y = y.to(self.device_str, non_blocking=True)
 
             optimizer.zero_grad()
-            logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                logits = model(x)
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             loss_val = float(loss.item())
             total_loss += loss_val
@@ -259,7 +285,15 @@ class ClusterWorker:
                     "loss": loss_val,
                 })
 
+        elapsed = max(time.time() - start_time, 1e-4)
+        tokens_per_sec = tokens_processed / elapsed
         avg_loss = (total_loss / steps_done) if steps_done > 0 else 0.0
+
+        self._last_round_metrics = {
+            "avg_loss": avg_loss,
+            "tokens_processed": tokens_processed,
+            "tokens_per_sec": tokens_per_sec,
+        }
         return avg_loss, dataloader_iter
 
     def execute_job(
@@ -429,9 +463,17 @@ class ClusterWorker:
                         dataloader=dataloader,
                         dataloader_iter=dataloader_iter,
                         steps_per_round=sync_interval_steps,
+                        job=job,
                         log_callback=log_callback,
                     )
-                    self.log(f"Round {current_round + 1}/{max_rounds} completed. Avg loss: {avg_loss:.4f}. Depositing weights...")
+                    round_metrics = getattr(self, "_last_round_metrics", {})
+                    tokens_per_sec = round_metrics.get("tokens_per_sec", 0.0)
+                    tokens_processed = round_metrics.get("tokens_processed", 0)
+
+                    self.log(
+                        f"Round {current_round + 1}/{max_rounds} completed. "
+                        f"Avg loss: {avg_loss:.4f}, Speed: {tokens_per_sec:,.0f} tok/s. Depositing weights & telemetry..."
+                    )
                 except Exception as exc:
                     import traceback
                     tb = traceback.format_exc()
@@ -445,6 +487,22 @@ class ClusterWorker:
                     round_num=current_round,
                     worker_id=self.worker_id,
                     state_dict={k: v.cpu() for k, v in model.state_dict().items()},
+                )
+
+                # Atomically deposit local worker telemetry
+                self.bus.save_worker_telemetry(
+                    job_id=job_id,
+                    round_num=current_round,
+                    worker_id=self.worker_id,
+                    telemetry={
+                        "worker_id": self.worker_id,
+                        "round": current_round,
+                        "steps_completed": sync_interval_steps,
+                        "avg_loss": round(avg_loss, 4),
+                        "tokens_processed": tokens_processed,
+                        "tokens_per_sec": round(tokens_per_sec, 1),
+                        "timestamp": time.time(),
+                    },
                 )
 
                 self._current_status = "SYNC_WAIT"

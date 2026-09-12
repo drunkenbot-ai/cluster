@@ -154,6 +154,10 @@ class ClusterCoordinator:
             state = self.bus.load_worker_weights(self.job_id, round_num, wid, device="cpu")
             worker_states.append(state)
             tel = self.bus.load_worker_telemetry(self.job_id, round_num, wid)
+            if not tel:
+                # Brief retry to handle network SMB/NFS cache latency
+                time.sleep(0.5)
+                tel = self.bus.load_worker_telemetry(self.job_id, round_num, wid)
             if tel:
                 worker_telemetries[wid] = tel
 
