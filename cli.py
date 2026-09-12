@@ -22,9 +22,31 @@ from .worker import ClusterWorker
 
 def cmd_worker(args: argparse.Namespace) -> int:
     """Run a persistent headless worker daemon."""
+    from .cluster_worker import (
+        acquire_singleton_lock,
+        get_device_tag,
+        get_running_worker_pid,
+        is_pid_running,
+        release_singleton_lock,
+    )
+    from .worker import get_hardware_info
+
     shared_dir = Path(args.shared_dir)
+    device_str, _, _ = get_hardware_info(args.device)
+    device_tag = get_device_tag(device_str)
+    wid_tag = f"wid_{args.worker_id}" if args.worker_id else None
 
     if getattr(args, "detach", False):
+        running_dev_pid = get_running_worker_pid(device_tag)
+        if running_dev_pid and is_pid_running(running_dev_pid):
+            print(f"[Worker] A worker is already running for device '{device_str}' on this machine (PID: {running_dev_pid}). Exiting.")
+            return 1
+        if wid_tag:
+            running_wid_pid = get_running_worker_pid(wid_tag)
+            if running_wid_pid and is_pid_running(running_wid_pid):
+                print(f"[Worker] A worker is already running with worker ID '{args.worker_id}' on this machine (PID: {running_wid_pid}). Exiting.")
+                return 1
+
         import subprocess
         flags = 0
         if sys.platform == "win32":
@@ -55,6 +77,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
         print("[Worker] You can now safely close this PowerShell window.")
         return 0
 
+    # 1. Enforce per-device singleton lock on this host
+    if not acquire_singleton_lock(device_tag):
+        return 1
+
+    # 2. Enforce per-worker-id singleton lock on this host
+    if wid_tag and not acquire_singleton_lock(wid_tag):
+        release_singleton_lock(device_tag)
+        return 1
+
     bus = ClusterStorageBus(shared_dir)
     worker = ClusterWorker(
         bus=bus,
@@ -70,6 +101,9 @@ def cmd_worker(args: argparse.Namespace) -> int:
         print("\n[Worker] Stopping worker daemon gracefully...")
     finally:
         worker.stop()
+        release_singleton_lock(device_tag)
+        if wid_tag:
+            release_singleton_lock(wid_tag)
         print("[Worker] Stopped.")
     return 0
 

@@ -544,6 +544,19 @@ class ClusterWorker:
 
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""
+        from .cluster_worker import acquire_singleton_lock, release_singleton_lock, get_device_tag
+
+        device_tag = get_device_tag(self.device_str)
+        if not acquire_singleton_lock(device_tag):
+            self.log(f"A worker is already running for device '{self.device_str}' on this machine. Exiting.", level="WARNING")
+            return
+
+        wid_tag = f"wid_{self.worker_id}"
+        if not acquire_singleton_lock(wid_tag):
+            release_singleton_lock(device_tag)
+            self.log(f"A worker is already running for worker ID '{self.worker_id}' on this machine. Exiting.", level="WARNING")
+            return
+
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         try:
             while not self._stop_event.is_set():
@@ -562,6 +575,8 @@ class ClusterWorker:
 
                 self._stop_event.wait(poll_interval)
         finally:
+            release_singleton_lock(device_tag)
+            release_singleton_lock(wid_tag)
             self._current_status = "OFFLINE"
             self._current_job_id = None
             try:

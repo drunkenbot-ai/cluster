@@ -191,7 +191,8 @@ def is_pid_running(pid: int) -> bool:
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not process:
-                return False
+                # If access is denied (ERROR_ACCESS_DENIED = 5), the process definitely exists and is running
+                return bool(kernel32.GetLastError() == 5)
             exit_code = ctypes.c_ulong()
             success = kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code))
             kernel32.CloseHandle(process)
@@ -238,14 +239,17 @@ def get_all_running_worker_pids() -> dict[str, int]:
 
 
 def acquire_singleton_lock(device_tag: str = "default") -> bool:
-    """Ensure only one cluster worker process runs per device on this host."""
+    """Ensure only one cluster worker process runs per device or worker ID on this host."""
     lock_path = get_lock_file(device_tag)
     if lock_path.exists():
         try:
             old_pid = int(lock_path.read_text().strip())
             if is_pid_running(old_pid):
-                print(f"[ClusterWorker] A worker is already running for device '{device_tag}' (PID: {old_pid}). Exiting.")
+                tag_label = f"worker ID '{device_tag[4:]}'" if device_tag.startswith("wid_") else f"device '{device_tag}'"
+                print(f"[ClusterWorker] A worker is already running for {tag_label} (PID: {old_pid}). Exiting.")
                 return False
+            else:
+                lock_path.unlink(missing_ok=True)
         except (ValueError, OSError):
             pass
 
@@ -1645,6 +1649,11 @@ def main() -> int:
     if not acquire_singleton_lock(device_tag):
         return 0
 
+    wid_tag = f"wid_{args.worker_id}" if args.worker_id else None
+    if wid_tag and not acquire_singleton_lock(wid_tag):
+        release_singleton_lock(device_tag)
+        return 0
+
     # Set process console title on Windows
     if sys.platform == "win32":
         try:
@@ -1663,6 +1672,8 @@ def main() -> int:
             except Exception:
                 pass
         release_singleton_lock(device_tag)
+        if wid_tag:
+            release_singleton_lock(wid_tag)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sig_handler)
@@ -1673,6 +1684,10 @@ def main() -> int:
         worker.run(poll_interval=args.poll_interval)
     except KeyboardInterrupt:
         _sig_handler(signal.SIGINT, None)
+    finally:
+        release_singleton_lock(device_tag)
+        if wid_tag:
+            release_singleton_lock(wid_tag)
     return 0
 
 
