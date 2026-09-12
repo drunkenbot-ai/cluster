@@ -102,6 +102,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         device=args.device,
         heartbeat_interval=args.heartbeat_interval,
     )
+    worker._lock_acquired = True
     print(f"[Worker] Started node {worker.worker_id} on {worker.device_str} ({worker.gpu_name}, {worker.vram_gb} GB VRAM)")
     print(f"[Worker] Connected to shared storage: {shared_dir.resolve()}")
     try:

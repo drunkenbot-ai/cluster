@@ -140,13 +140,14 @@ class ClusterWorker:
         self._current_job_id: Optional[str] = None
         self._current_status: str = "IDLE"
 
-        # Register worker in SQLite database
+        # Register worker in SQLite database and clear any stale pending command
         self.bus.register_worker(
             worker_id=self.worker_id,
             hostname=self.hostname,
             gpu_name=self.gpu_name,
             vram_gb=self.vram_gb,
         )
+        self.bus.set_worker_command(self.worker_id, None)
 
         # Start background heartbeat daemon thread
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -597,15 +598,17 @@ class ClusterWorker:
         from .cluster_worker import acquire_singleton_lock, release_singleton_lock, get_device_tag
 
         device_tag = get_device_tag(self.device_str)
-        if not acquire_singleton_lock(device_tag):
-            self.log(f"A worker is already running for device '{self.device_str}' on this machine. Exiting.", level="WARNING")
-            return
-
         wid_tag = f"wid_{self.worker_id}"
-        if not acquire_singleton_lock(wid_tag):
-            release_singleton_lock(device_tag)
-            self.log(f"A worker is already running for worker ID '{self.worker_id}' on this machine. Exiting.", level="WARNING")
-            return
+        if not getattr(self, "_lock_acquired", False):
+            if not acquire_singleton_lock(device_tag):
+                self.log(f"A worker is already running for device '{self.device_str}' on this machine. Exiting.", level="WARNING")
+                return
+
+            if not acquire_singleton_lock(wid_tag):
+                release_singleton_lock(device_tag)
+                self.log(f"A worker is already running for worker ID '{self.worker_id}' on this machine. Exiting.", level="WARNING")
+                return
+            self._lock_acquired = True
 
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         try:
