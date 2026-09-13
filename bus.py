@@ -188,6 +188,7 @@ class ClusterStorageBus:
                 ("ram_total_gb", "REAL DEFAULT 0.0"),
                 ("vram_used_gb", "REAL DEFAULT 0.0"),
                 ("metrics_json", "TEXT"),
+                ("enabled", "INTEGER DEFAULT 1"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE workers ADD COLUMN {col_def[0]} {col_def[1]};")
@@ -335,11 +336,14 @@ class ClusterStorageBus:
             last_hb = float(data.get("last_heartbeat") or 0)
             is_fresh = (now - last_hb) < active_within_seconds
             stored_status = str(data.get("status") or "OFFLINE").upper()
+            data["enabled"] = bool(data.get("enabled", 1)) if data.get("enabled") is not None else True
             if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
                 data["is_online"] = False
                 data["status"] = "OFFLINE"
             else:
                 data["is_online"] = True
+                if not data["enabled"]:
+                    data["status"] = "DISABLED"
             results.append(data)
         return results
 
@@ -360,6 +364,31 @@ class ClusterStorageBus:
             row = cursor.fetchone()
             return row["command"] if row and row["command"] else None
         return self._run_with_retry(_op, default_on_error=None, silent=True)
+
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> None:
+        """Enable or disable a worker from claiming cluster jobs."""
+        val = 1 if enabled else 0
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE workers SET enabled = ?, status = CASE WHEN ? = 0 THEN 'DISABLED' ELSE 'IDLE' END WHERE worker_id = ?;",
+                (val, val, worker_id),
+            )
+            if not enabled:
+                conn.execute(
+                    "UPDATE job_participants SET status = 'DROPPED' WHERE worker_id = ?;",
+                    (worker_id,),
+                )
+        self._run_with_retry(_op)
+
+    def is_worker_enabled(self, worker_id: str) -> bool:
+        """Check whether a worker is enabled to claim cluster jobs."""
+        def _op(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                return bool(row[0])
+            return True
+        return self._run_with_retry(_op, default_on_error=True)
 
     def delete_worker(self, worker_id: str) -> bool:
         """Delete a worker record from the database."""
@@ -642,11 +671,14 @@ class ClusterStorageBus:
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
         """Claim a shard index for a job. Returns (shard_index, total_shards)."""
         def _op(conn: sqlite3.Connection) -> tuple[int, int]:
-            # Guard: reject slot claiming if worker is degraded, incompatible, or offline
-            cursor = conn.execute("SELECT status FROM workers WHERE worker_id = ?;", (worker_id,))
+            # Guard: reject slot claiming if worker is degraded, incompatible, offline, or disabled
+            cursor = conn.execute("SELECT status, enabled FROM workers WHERE worker_id = ?;", (worker_id,))
             w_row = cursor.fetchone()
-            if w_row and str(w_row["status"]).upper() in {"DEGRADED", "INCOMPATIBLE", "OFFLINE"}:
-                raise RuntimeError(f"Worker '{worker_id}' is in status '{w_row['status']}' and cannot claim a job slot.")
+            if w_row:
+                if w_row["enabled"] is not None and not bool(w_row["enabled"]):
+                    raise RuntimeError(f"Worker '{worker_id}' is DISABLED and cannot claim a job slot.")
+                if str(w_row["status"]).upper() in {"DEGRADED", "INCOMPATIBLE", "OFFLINE", "DISABLED"}:
+                    raise RuntimeError(f"Worker '{worker_id}' is in status '{w_row['status']}' and cannot claim a job slot.")
 
             # Check if worker already has a slot
             cursor = conn.execute(

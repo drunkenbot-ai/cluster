@@ -338,8 +338,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             r_num = int(metrics.get("round", 0)) + 1
             max_r = int(metrics.get("max_rounds", 0))
             loss = float(metrics.get("global_loss", 0.0))
+            val_loss = metrics.get("val_loss")
+            val_str = f" | Validation Loss {float(val_loss):.4f}" if val_loss is not None else ""
             spd = float(metrics.get("aggregate_tokens_per_sec", 0.0))
-            print(f"[COORDINATOR] >>> Round {r_num}/{max_r} Averaged! Global Loss: {loss:.4f} | Speed: {spd:,.0f} tok/s", flush=True)
+            print(f"[COORDINATOR] >>> Round {r_num}/{max_r} Averaged! Global Loss: {loss:.4f}{val_str} | Speed: {spd:,.0f} tok/s", flush=True)
         elif m_type == "round_waiting":
             r_num = int(metrics.get("round", 0)) + 1
             ready = int(metrics.get("ready_workers", 0))

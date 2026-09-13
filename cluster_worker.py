@@ -687,6 +687,7 @@ class StandaloneStorageBus:
                 ("ram_total_gb", "REAL DEFAULT 0.0"),
                 ("vram_used_gb", "REAL DEFAULT 0.0"),
                 ("metrics_json", "TEXT"),
+                ("enabled", "INTEGER DEFAULT 1"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE workers ADD COLUMN {col_def[0]} {col_def[1]};")
@@ -846,11 +847,14 @@ class StandaloneStorageBus:
             last_hb = float(data.get("last_heartbeat") or 0)
             is_fresh = (now - last_hb) < active_within_seconds
             stored_status = str(data.get("status") or "OFFLINE").upper()
+            data["enabled"] = bool(data.get("enabled", 1)) if data.get("enabled") is not None else True
             if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
                 data["is_online"] = False
                 data["status"] = "OFFLINE"
             else:
                 data["is_online"] = True
+                if not data["enabled"]:
+                    data["status"] = "DISABLED"
             results.append(data)
         return results
 
@@ -880,7 +884,34 @@ class StandaloneStorageBus:
         return self._run_with_retry(_op, default_on_error=None, silent=True)
 
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
+        if not self.is_worker_enabled(worker_id):
+            raise RuntimeError(f"Worker '{worker_id}' is DISABLED and cannot claim a job slot.")
         return self.get_worker_shard_assignment(job_id, worker_id, round_num=0)
+
+    def set_worker_enabled(self, worker_id: str, enabled: bool) -> None:
+        """Enable or disable a worker from claiming cluster jobs."""
+        val = 1 if enabled else 0
+        def _op(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE workers SET enabled = ?, status = CASE WHEN ? = 0 THEN 'DISABLED' ELSE 'IDLE' END WHERE worker_id = ?;",
+                (val, val, worker_id),
+            )
+            if not enabled:
+                conn.execute(
+                    "UPDATE job_participants SET status = 'DROPPED' WHERE worker_id = ?;",
+                    (worker_id,),
+                )
+        self._run_with_retry(_op)
+
+    def is_worker_enabled(self, worker_id: str) -> bool:
+        """Check whether a worker is enabled to claim cluster jobs."""
+        def _op(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
+            row = cursor.fetchone()
+            if row is not None and row[0] is not None:
+                return bool(row[0])
+            return True
+        return self._run_with_retry(_op, default_on_error=True)
 
     def get_worker_shard_assignment(self, job_id: str, worker_id: str, round_num: int = 0) -> tuple[int, int]:
         def _op(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -1480,6 +1511,12 @@ class StandaloneWorker:
                     self.log(f"Received RESTART command. Respawning process...")
                     self._restart_process()
 
+                # Check if worker is disabled by operator: remain active and heartbeating, but do not claim jobs
+                if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+                    self._heartbeat(status="DISABLED", current_job_id=None)
+                    time.sleep(poll_interval)
+                    continue
+
                 self._heartbeat(status="IDLE", current_job_id=None)
                 active_job = self.bus.get_active_job()
 
@@ -1506,6 +1543,9 @@ class StandaloneWorker:
 
     def is_job_compatible(self, job: dict[str, Any]) -> tuple[bool, str]:
         """Check if this worker node and device are compatible with the requested job."""
+        if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+            return False, f"Worker '{self.worker_id}' is disabled by operator."
+
         if getattr(self, "_current_status", "") == "DEGRADED":
             return False, "Worker is in DEGRADED status due to failed hardware preflight checks."
 

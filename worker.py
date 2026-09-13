@@ -1013,6 +1013,17 @@ class ClusterWorker:
                     self.log(f"Job {job_id} stopped.")
                     return False
 
+                # Operator disable guard: exit cleanly if worker was disabled mid-job
+                if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+                    self.log(f"Worker {self.worker_id} was disabled by operator. Pausing participation in job {job_id}.")
+                    self._current_status = "DISABLED"
+                    self._current_job_id = None
+                    try:
+                        self.bus.heartbeat(self.worker_id, status="DISABLED", current_job_id=None)
+                    except Exception:
+                        pass
+                    return True
+
                 # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
                 try:
                     new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(
@@ -1376,6 +1387,13 @@ class ClusterWorker:
         Returns:
             (True, "Compatible") or (False, "<detailed reason>")
         """
+        # 0. Check operator enable/disable status
+        if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+            return False, f"Worker '{self.worker_id}' is disabled by operator."
+        base_id = self.worker_id.split("_slot")[0]
+        if base_id != self.worker_id and not getattr(self.bus, "is_worker_enabled", lambda wid: True)(base_id):
+            return False, f"Primary worker node '{base_id}' is disabled by operator."
+
         # 1. Check worker health / preflight status
         if getattr(self, "_current_status", "") == "DEGRADED" or not getattr(self, "_preflight_ok", True):
             return False, "Worker is in DEGRADED status due to failed hardware preflight checks."
@@ -1524,6 +1542,22 @@ class ClusterWorker:
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         try:
             while not self._stop_event.is_set():
+                # Check if worker is disabled by operator: remain active and heartbeating, but do not claim jobs
+                if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+                    self._current_status = "DISABLED"
+                    self._current_job_id = None
+                    try:
+                        self.bus.heartbeat(
+                            self.worker_id,
+                            status="DISABLED",
+                            current_job_id=None,
+                            metrics=self._collect_system_metrics(),
+                        )
+                    except Exception:
+                        pass
+                    self._stop_event.wait(poll_interval)
+                    continue
+
                 self._current_status = "IDLE"
                 self._current_job_id = None
 
