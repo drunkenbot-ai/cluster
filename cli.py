@@ -45,11 +45,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
     device_tag = get_device_tag(device_str)
     wid_tag = f"wid_{args.worker_id}" if args.worker_id else None
 
+    allow_shared = getattr(args, "allow_shared_device", False)
+    ephemeral_jid = getattr(args, "ephemeral_job_id", None)
+
     if getattr(args, "detach", False):
-        running_dev_pid = get_running_worker_pid(device_tag)
-        if running_dev_pid and is_pid_running(running_dev_pid):
-            print(f"[Worker] A worker is already running for device '{device_str}' on this machine (PID: {running_dev_pid}). Exiting.")
-            return 1
+        if not allow_shared:
+            running_dev_pid = get_running_worker_pid(device_tag)
+            if running_dev_pid and is_pid_running(running_dev_pid):
+                print(f"[Worker] A worker is already running for device '{device_str}' on this machine (PID: {running_dev_pid}). Exiting.")
+                return 1
         if wid_tag:
             running_wid_pid = get_running_worker_pid(wid_tag)
             if running_wid_pid and is_pid_running(running_wid_pid):
@@ -86,13 +90,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
         print("[Worker] You can now safely close this PowerShell window.")
         return 0
 
-    # 1. Enforce per-device singleton lock on this host
-    if not acquire_singleton_lock(device_tag):
-        return 1
+    # 1. Enforce per-device singleton lock on this host (unless allow_shared_device is set)
+    if not allow_shared:
+        if not acquire_singleton_lock(device_tag):
+            return 1
 
     # 2. Enforce per-worker-id singleton lock on this host
     if wid_tag and not acquire_singleton_lock(wid_tag):
-        release_singleton_lock(device_tag)
+        if not allow_shared:
+            release_singleton_lock(device_tag)
         return 1
 
     bus = ClusterStorageBus(shared_dir)
@@ -101,6 +107,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
         worker_id=args.worker_id,
         device=args.device,
         heartbeat_interval=args.heartbeat_interval,
+        ephemeral_job_id=ephemeral_jid,
+        allow_shared_device=allow_shared,
     )
     worker._lock_acquired = True
     print(f"[Worker] Started node {worker.worker_id} on {worker.device_str} ({worker.gpu_name}, {worker.vram_gb} GB VRAM)")
@@ -109,9 +117,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
         worker.run_daemon(poll_interval=args.poll_interval)
     except KeyboardInterrupt:
         print("\n[Worker] Stopping worker daemon gracefully...")
+    except BaseException as exc:
+        import traceback
+        print(f"\n[Worker CRITICAL] Fatal error in worker daemon: {exc}", file=sys.stderr, flush=True)
+        print(traceback.format_exc(), file=sys.stderr, flush=True)
+        return 1
     finally:
         worker.stop()
-        release_singleton_lock(device_tag)
+        if not allow_shared:
+            release_singleton_lock(device_tag)
         if wid_tag:
             release_singleton_lock(wid_tag)
         print("[Worker] Stopped.")
@@ -237,6 +251,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_worker.add_argument("--heartbeat-interval", type=float, default=5.0, help="Heartbeat interval in seconds")
     p_worker.add_argument("--poll-interval", type=float, default=2.0, help="Job polling interval in seconds")
     p_worker.add_argument("--detach", "--background", action="store_true", help="Launch detached in background so you can close this terminal")
+    p_worker.add_argument("--ephemeral-job-id", default=None, help="Exit automatically when specified job completes")
+    p_worker.add_argument("--allow-shared-device", action="store_true", help="Allow multiple worker slots on the same compute device")
     p_worker.set_defaults(func=cmd_worker)
 
     # Status subcommand

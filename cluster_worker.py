@@ -310,6 +310,124 @@ def stop_running_worker(device_tag: Optional[str] = None) -> int:
     return 0
 
 
+def is_network_path(path_str: str) -> bool:
+    """Determine if a file path resides on a remote network share (SMB/NFS/UNC)."""
+    p = str(path_str).strip()
+    if p.startswith(("\\\\", "//")):
+        return True
+    if sys.platform == "win32" and len(p) >= 2 and p[1] == ":":
+        try:
+            drive_root = p[:2] + "\\"
+            # DRIVE_REMOTE = 4 in Windows API
+            return ctypes.windll.kernel32.GetDriveTypeW(drive_root) == 4
+        except Exception:
+            pass
+    return False
+
+
+def purge_local_dataset_cache(
+    cache_dir: Optional[Path] = None,
+    keep_files: Optional[set[str]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Remove/delete stale .npy files from local cache directory to keep local storage clean."""
+    log = log_fn or (lambda msg, **kw: print(f"[DatasetCache] {msg}"))
+    if cache_dir is None:
+        cache_dir = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "llm_cluster_cache"
+    if not cache_dir.exists():
+        return 0
+
+    keep = keep_files or set()
+    log(f"[DatasetCache] Cleaning local SSD cache directory ({cache_dir})...")
+    purged_count = 0
+    for f in cache_dir.glob("*.npy"):
+        if f.name in keep:
+            continue
+        try:
+            f.unlink(missing_ok=True)
+            log(f"[DatasetCache] Removed old cache file: {f.name}")
+            purged_count += 1
+        except Exception as exc:
+            log(f"[DatasetCache] Notice: could not remove {f.name}: {exc}")
+
+    if purged_count > 0:
+        log(f"[DatasetCache] Purged {purged_count} stale .npy file(s) before caching new dataset.")
+    else:
+        log(f"[DatasetCache] Local cache is clean (0 stale .npy files found).")
+    return purged_count
+
+
+def cache_dataset_to_local(
+    remote_path: str,
+    log_fn: Optional[Callable[[str], None]] = None,
+    keep_files: Optional[set[str]] = None,
+) -> str:
+    """Safely cache remote/network dataset .npy file to fast local SSD storage."""
+    log = log_fn or (lambda msg, **kw: print(f"[DatasetCache] {msg}"))
+
+    if not remote_path or not os.path.exists(remote_path):
+        return remote_path
+
+    if not is_network_path(remote_path):
+        return remote_path
+
+    cache_dir = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "llm_cluster_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log(f"[DatasetCache] Could not create local cache directory {cache_dir}: {exc}")
+        return remote_path
+
+    remote_file = Path(remote_path)
+    local_file = cache_dir / remote_file.name
+
+    try:
+        remote_stat = remote_file.stat()
+        remote_size = remote_stat.st_size
+        remote_size_gb = remote_size / (1024 ** 3)
+        remote_mtime = remote_stat.st_mtime
+
+        if local_file.exists():
+            local_stat = local_file.stat()
+            if local_stat.st_size == remote_size and abs(local_stat.st_mtime - remote_mtime) < 2.0:
+                log(f"[DatasetCache] Verified existing local SSD dataset cache: {local_file.name} ({remote_size_gb:.2f} GB)")
+                return str(local_file)
+
+        effective_keep = set(keep_files or ())
+        effective_keep.add(remote_file.name)
+        purge_local_dataset_cache(cache_dir=cache_dir, keep_files=effective_keep, log_fn=log)
+
+        free_space = shutil.disk_usage(str(cache_dir)).free
+        free_gb = free_space / (1024 ** 3)
+        if free_space < remote_size * 1.15:
+            log(
+                f"[DatasetCache] Insufficient local disk space to cache dataset "
+                f"({free_gb:.1f} GB free vs {remote_size_gb:.1f} GB required). Falling back to network share.",
+            )
+            return remote_path
+
+        log(f"[DatasetCache] Streaming network dataset {remote_file.name} ({remote_size_gb:.2f} GB) to local SSD ({local_file})...")
+        t0 = time.time()
+        buf_size = 64 * 1024 * 1024
+        with open(str(remote_file), "rb") as src, open(str(local_file), "wb") as dst:
+            while True:
+                chunk = src.read(buf_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+        os.utime(str(local_file), (remote_mtime, remote_mtime))
+        elapsed = max(time.time() - t0, 0.001)
+        speed_mb_s = (remote_size / (1024 * 1024)) / elapsed
+        log(f"[DatasetCache] Cache transfer completed in {elapsed:.1f}s ({speed_mb_s:.1f} MB/s). Ready for zero-latency local training.")
+        return str(local_file)
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        log(f"[DatasetCache] Failed to cache dataset to local SSD ({exc}). Falling back to network share.\nTraceback:\n{tb}")
+        return remote_path
+
+
 def get_worker_executable() -> str:
     """Get or create a named worker executable (cluster_worker.exe) on Windows for Task Manager clarity."""
     if sys.platform != "win32":
@@ -1311,13 +1429,30 @@ class StandaloneWorker:
             self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
 
             dataset_path = job.get("dataset_path", "")
-            if not os.path.exists(dataset_path):
-                err = f"Dataset not found at: {dataset_path}"
+            val_dataset_path = job.get("val_dataset_path")
+            if not val_dataset_path or not os.path.exists(val_dataset_path):
+                cand_val = Path(dataset_path).parent / "val_tokens.npy"
+                if cand_val.exists():
+                    val_dataset_path = str(cand_val)
+                else:
+                    cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
+                    if cand_shared_val.exists():
+                        val_dataset_path = str(cand_shared_val)
+
+            target_cache_files = {Path(dataset_path).name}
+            if val_dataset_path and os.path.exists(val_dataset_path):
+                target_cache_files.add(Path(val_dataset_path).name)
+
+            purge_local_dataset_cache(keep_files=target_cache_files, log_fn=self.log)
+            local_dataset_path = cache_dataset_to_local(dataset_path, log_fn=self.log, keep_files=target_cache_files)
+
+            if not os.path.exists(local_dataset_path):
+                err = f"Dataset not found at: {local_dataset_path}"
                 self.log(err, level="ERROR")
                 self._heartbeat(status="ERROR", current_job_id=job_id)
                 return
 
-            token_array = np.load(dataset_path, mmap_mode="r")
+            token_array = np.load(local_dataset_path, mmap_mode="r")
             model_cfg = job.get("model_config", {})
             training_cfg = job.get("training_config", {})
 
@@ -1393,19 +1528,10 @@ class StandaloneWorker:
             dataloader_iter = iter(dataloader)
 
             # Prepare validation dataset if available
-            val_dataset_path = job.get("val_dataset_path")
-            if not val_dataset_path or not os.path.exists(val_dataset_path):
-                cand_val = Path(dataset_path).parent / "val_tokens.npy"
-                if cand_val.exists():
-                    val_dataset_path = str(cand_val)
-                else:
-                    cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
-                    if cand_shared_val.exists():
-                        val_dataset_path = str(cand_shared_val)
-
             if val_dataset_path and os.path.exists(val_dataset_path):
                 try:
-                    val_token_array = np.load(val_dataset_path, mmap_mode="r")
+                    local_val_path = cache_dataset_to_local(val_dataset_path, log_fn=self.log, keep_files=target_cache_files)
+                    val_token_array = np.load(local_val_path, mmap_mode="r")
                     if len(val_token_array) > context_length:
                         val_ds = StandaloneTokenDataset(val_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
                         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)

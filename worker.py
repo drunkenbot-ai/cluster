@@ -17,6 +17,8 @@ import platform
 import socket
 import subprocess
 import sys
+import shutil
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -29,6 +31,207 @@ from torch.utils.data import DataLoader
 
 from .bus import ClusterStorageBus
 from .sharding import ShardedTokenDataset
+
+
+def is_network_path(path_str: str) -> bool:
+    """Determine if a file path resides on a remote network share (SMB/NFS/UNC)."""
+    p = str(path_str).strip()
+    if p.startswith(("\\\\", "//")):
+        return True
+    if sys.platform == "win32" and len(p) >= 2 and p[1] == ":":
+        try:
+            import ctypes
+            drive_root = p[:2] + "\\"
+            # DRIVE_REMOTE = 4 in Windows API
+            return ctypes.windll.kernel32.GetDriveTypeW(drive_root) == 4
+        except Exception:
+            pass
+    return False
+
+
+def purge_local_dataset_cache(
+    cache_dir: Optional[Path] = None,
+    keep_files: Optional[set[str]] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Remove/delete stale .npy files from local cache directory to keep local storage clean.
+
+    Args:
+        cache_dir: Optional cache directory path. Defaults to LOCALAPPDATA/llm_cluster_cache.
+        keep_files: Optional set of filenames to preserve (e.g. active train/val tokens).
+        log_fn: Optional logger callable.
+
+    Returns:
+        Number of .npy files removed.
+    """
+    log = log_fn or (lambda msg, **kw: print(f"[DatasetCache] {msg}"))
+    if cache_dir is None:
+        cache_dir = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "llm_cluster_cache"
+    if not cache_dir.exists():
+        return 0
+
+    keep = keep_files or set()
+    log(f"[DatasetCache] Cleaning local SSD cache directory ({cache_dir})...")
+    purged_count = 0
+    for f in cache_dir.glob("*.npy"):
+        if f.name in keep:
+            continue
+        try:
+            f.unlink(missing_ok=True)
+            log(f"[DatasetCache] Removed old cache file: {f.name}")
+            purged_count += 1
+        except Exception as exc:
+            log(f"[DatasetCache] Notice: could not remove {f.name}: {exc}")
+
+    if purged_count > 0:
+        log(f"[DatasetCache] Purged {purged_count} stale .npy file(s) before caching new dataset.")
+    else:
+        log(f"[DatasetCache] Local cache is clean (0 stale .npy files found).")
+    return purged_count
+
+
+def cache_dataset_to_local(
+    remote_path: str,
+    log_fn: Optional[Callable[[str], None]] = None,
+    keep_files: Optional[set[str]] = None,
+) -> str:
+    """Safely cache remote/network dataset .npy file to fast local SSD storage.
+
+    Purges stale .npy files before copying new files to keep local disk clean.
+    Prevents unrecoverable Windows STATUS_IN_PAGE_ERROR (0xC0000006) on network shares.
+
+    Args:
+        remote_path: Path to dataset .npy on network share (SMB/NFS).
+        log_fn: Optional logger callable.
+        keep_files: Optional set of filenames to preserve during cache cleanup.
+
+    Returns:
+        Local path to the cached .npy file (or original remote path if caching is skipped/impossible).
+    """
+    log = log_fn or (lambda msg, **kw: print(f"[DatasetCache] {msg}"))
+
+    if not remote_path or not os.path.exists(remote_path):
+        return remote_path
+
+    # If it's already on a local non-network drive, no caching needed
+    if not is_network_path(remote_path):
+        return remote_path
+
+    cache_dir = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "llm_cluster_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        log(f"[DatasetCache] Could not create local cache directory {cache_dir}: {exc}", level="WARNING")
+        return remote_path
+
+    remote_file = Path(remote_path)
+    local_file = cache_dir / remote_file.name
+
+    try:
+        remote_stat = remote_file.stat()
+        remote_size = remote_stat.st_size
+        remote_size_gb = remote_size / (1024 ** 3)
+        remote_mtime = remote_stat.st_mtime
+
+        # Check if current file is already cached with identical size & mtime
+        if local_file.exists():
+            local_stat = local_file.stat()
+            if local_stat.st_size == remote_size and abs(local_stat.st_mtime - remote_mtime) < 2.0:
+                log(f"[DatasetCache] Verified existing local SSD dataset cache: {local_file.name} ({remote_size_gb:.2f} GB)")
+                return str(local_file)
+
+        # Purge stale .npy files from cache before copying new to keep local storage clean
+        effective_keep = set(keep_files or ())
+        effective_keep.add(remote_file.name)
+        purge_local_dataset_cache(cache_dir=cache_dir, keep_files=effective_keep, log_fn=log)
+
+        # Check free disk space on local cache drive
+        free_space = shutil.disk_usage(str(cache_dir)).free
+        free_gb = free_space / (1024 ** 3)
+        if free_space < remote_size * 1.15:
+            log(
+                f"[DatasetCache] Insufficient local disk space to cache dataset "
+                f"({free_gb:.1f} GB free vs {remote_size_gb:.1f} GB required). Falling back to direct network share.",
+                level="WARNING",
+            )
+            return remote_path
+
+        log(f"[DatasetCache] Streaming network dataset {remote_file.name} ({remote_size_gb:.2f} GB) to local SSD ({local_file})...")
+        t0 = time.time()
+        buf_size = 64 * 1024 * 1024  # 64 MB buffered streaming
+        with open(str(remote_file), "rb") as src, open(str(local_file), "wb") as dst:
+            while True:
+                chunk = src.read(buf_size)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+        os.utime(str(local_file), (remote_mtime, remote_mtime))
+        elapsed = max(time.time() - t0, 0.001)
+        speed_mb_s = (remote_size / (1024 * 1024)) / elapsed
+        log(f"[DatasetCache] Cache transfer completed in {elapsed:.1f}s ({speed_mb_s:.1f} MB/s). Ready for zero-latency local training.")
+        return str(local_file)
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        log(f"[DatasetCache] Failed to cache dataset to local SSD ({exc}). Falling back to network share.\nTraceback:\n{tb}", level="WARNING")
+        return remote_path
+
+
+def calculate_optimal_worker_slots(
+    model_cfg: dict[str, Any],
+    training_cfg: dict[str, Any],
+    device_str: str,
+) -> tuple[int, float, float]:
+    """Calculate optimal number of worker processes to spawn on this node based on VRAM capacity.
+
+    Args:
+        model_cfg: Model architecture parameters.
+        training_cfg: Training parameters (batch size, precision).
+        device_str: Device string (e.g. 'cuda:0', 'cpu').
+
+    Returns:
+        (optimal_slots, estimated_job_gb, node_vram_gb)
+    """
+    if not device_str.startswith("cuda") or not torch.cuda.is_available():
+        return 1, 0.0, 0.0
+
+    try:
+        dev_idx = 0
+        if ":" in device_str:
+            try:
+                dev_idx = int(device_str.split(":")[1])
+            except ValueError:
+                dev_idx = 0
+        total_vram_bytes = torch.cuda.get_device_properties(dev_idx).total_memory
+        node_vram_gb = total_vram_bytes / (1024 ** 3)
+    except Exception:
+        return 1, 0.0, 0.0
+
+    explicit_gb = float(training_cfg.get("vram_required_gb") or model_cfg.get("vram_required_gb") or 0.0)
+    if explicit_gb > 0:
+        estimated_job_gb = explicit_gb
+    else:
+        vocab_size = int(model_cfg.get("vocab_size") or 32000)
+        emb_size = int(model_cfg.get("embedding_size") or 768)
+        n_layers = int(model_cfg.get("layer_count") or 12)
+        ctx_len = int(model_cfg.get("context_length") or 1024)
+        batch_size = int(training_cfg.get("batch_size") or 2)
+
+        # Estimate parameter count: token embeddings + transformer layers + head
+        approx_params = (vocab_size * emb_size * 2) + (n_layers * 12 * emb_size * emb_size)
+        prec = str(training_cfg.get("precision", "float16")).lower()
+        bytes_per_param = 16 if "16" in prec else 24
+        param_bytes = approx_params * bytes_per_param
+        activation_bytes = batch_size * ctx_len * emb_size * n_layers * 16
+        cuda_overhead = 1024 ** 3
+
+        total_job_bytes = param_bytes + activation_bytes + cuda_overhead
+        estimated_job_gb = max(round(total_job_bytes / (1024 ** 3), 2), 4.0)
+
+    # Calculate slots: allow 1.05x safety margin
+    slots = max(1, min(4, int(node_vram_gb // (estimated_job_gb * 1.05))))
+    return slots, estimated_job_gb, node_vram_gb
 
 
 def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str, float]:
@@ -145,6 +348,8 @@ class ClusterWorker:
         worker_id: Optional[str] = None,
         device: Optional[str] = None,
         heartbeat_interval: float = 5.0,
+        ephemeral_job_id: Optional[str] = None,
+        allow_shared_device: bool = False,
     ) -> None:
         """Initialize worker daemon.
 
@@ -153,12 +358,17 @@ class ClusterWorker:
             worker_id: Unique worker node identifier (defaults to hostname-pid).
             device: Compute device ('cuda:0', 'cpu', etc.).
             heartbeat_interval: Heartbeat interval in seconds.
+            ephemeral_job_id: If set, worker exits automatically after completing this job.
+            allow_shared_device: If True, bypasses per-device singleton lock to permit auxiliary slots.
         """
         self.bus = bus
         self.hostname = socket.gethostname()
         self.worker_id = worker_id or f"{self.hostname}_{os.getpid()}"
         self.device_str, self.gpu_name, self.vram_gb = get_hardware_info(device)
         self.heartbeat_interval = heartbeat_interval
+        self.ephemeral_job_id = ephemeral_job_id
+        self.allow_shared_device = allow_shared_device
+        self._child_worker_procs: list[tuple[subprocess.Popen, str]] = []
         self._stop_event = threading.Event()
         self._current_job_id: Optional[str] = None
         self._current_status = "IDLE"
@@ -215,7 +425,8 @@ class ClusterWorker:
                     except Exception:
                         pass
                     from .cluster_worker import release_singleton_lock, get_device_tag
-                    release_singleton_lock(get_device_tag(self.device_str))
+                    if not self.allow_shared_device:
+                        release_singleton_lock(get_device_tag(self.device_str))
                     release_singleton_lock(f"wid_{self.worker_id}")
                     os._exit(0)
                 elif cmd == "RESTART":
@@ -232,7 +443,8 @@ class ClusterWorker:
                     except Exception:
                         pass
                     from .cluster_worker import release_singleton_lock, get_device_tag
-                    release_singleton_lock(get_device_tag(self.device_str))
+                    if not self.allow_shared_device:
+                        release_singleton_lock(get_device_tag(self.device_str))
                     release_singleton_lock(f"wid_{self.worker_id}")
                     time.sleep(0.3)
                     flags = 0
@@ -260,6 +472,12 @@ class ClusterWorker:
     def stop(self) -> None:
         """Signal worker to gracefully stop."""
         self._stop_event.set()
+        for proc, aux_wid in self._child_worker_procs:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
         if self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2.0)
         try:
@@ -433,19 +651,101 @@ class ClusterWorker:
 
         try:
             try:
-                # Claim data shard slot
+                # 1. Resolve dataset paths and cache remote .npy files to local SSD storage
+                val_dataset_path = job.get("val_dataset_path")
+                if not val_dataset_path or not os.path.exists(val_dataset_path):
+                    cand_val = Path(dataset_path).parent / "val_tokens.npy"
+                    if cand_val.exists():
+                        val_dataset_path = str(cand_val)
+                    else:
+                        cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
+                        if cand_shared_val.exists():
+                            val_dataset_path = str(cand_shared_val)
+
+                target_cache_files = {Path(dataset_path).name}
+                if val_dataset_path and os.path.exists(val_dataset_path):
+                    target_cache_files.add(Path(val_dataset_path).name)
+
+                # Primary worker purges stale .npy files from local SSD cache before copying new
+                if self.ephemeral_job_id is None:
+                    purge_local_dataset_cache(keep_files=target_cache_files, log_fn=self.log)
+
+                # Safely cache remote/network dataset .npy to fast local SSD storage
+                local_dataset_path = cache_dataset_to_local(dataset_path, log_fn=self.log, keep_files=target_cache_files)
+                local_val_dataset_path = None
+                if val_dataset_path and os.path.exists(val_dataset_path):
+                    local_val_dataset_path = cache_dataset_to_local(val_dataset_path, log_fn=self.log, keep_files=target_cache_files)
+
+                # 2. Dynamic multi-worker: spawn auxiliary workers if node has excess VRAM (primary daemon only)
+                if self.ephemeral_job_id is None and not self._child_worker_procs:
+                    optimal_slots, est_gb, node_gb = calculate_optimal_worker_slots(
+                        model_config, training_config, self.device_str
+                    )
+                    if optimal_slots > 1:
+                        self.log(
+                            f"Dynamic multi-worker: Node VRAM ({node_gb:.1f} GB) supports {optimal_slots} concurrent slots "
+                            f"(Job estimate: {est_gb:.1f} GB/slot). Spawning {optimal_slots - 1} auxiliary worker process(es)..."
+                        )
+                        for slot_idx in range(2, optimal_slots + 1):
+                            aux_worker_id = f"{self.worker_id}_slot{slot_idx}"
+                            if sys.argv[0].endswith("cluster_worker.py"):
+                                cmd = [
+                                    sys.executable,
+                                    sys.argv[0],
+                                    "--shared-dir",
+                                    str(self.bus.shared_dir),
+                                    "--worker-id",
+                                    aux_worker_id,
+                                    "--device",
+                                    self.device_str,
+                                    "--ephemeral-job-id",
+                                    job_id,
+                                    "--allow-shared-device",
+                                ]
+                            else:
+                                cmd = [
+                                    sys.executable,
+                                    "-m",
+                                    "cluster.cli",
+                                    "worker",
+                                    "--shared-dir",
+                                    str(self.bus.shared_dir),
+                                    "--worker-id",
+                                    aux_worker_id,
+                                    "--device",
+                                    self.device_str,
+                                    "--ephemeral-job-id",
+                                    job_id,
+                                    "--allow-shared-device",
+                                ]
+                            try:
+                                self.log(f"Launching auxiliary worker slot {slot_idx}: {aux_worker_id}...")
+                                p = subprocess.Popen(
+                                    cmd,
+                                    stdout=None,
+                                    stderr=None,
+                                    stdin=subprocess.DEVNULL,
+                                )
+                                self._child_worker_procs.append((p, aux_worker_id))
+                            except Exception as e:
+                                self.log(f"Failed to spawn auxiliary worker slot {slot_idx}: {e}", level="WARNING")
+
+                        if self._child_worker_procs:
+                            time.sleep(1.5)
+
+                # 3. Claim data shard slot
                 shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
                 self.log(f"Assigned data shard slot {shard_idx + 1} of {total_shards} total nodes")
 
-                # Prepare dataset
-                if not os.path.exists(dataset_path):
-                    err = f"Dataset path not found on shared storage: {dataset_path}"
+                # 4. Prepare local dataset from cached SSD file
+                if not os.path.exists(local_dataset_path):
+                    err = f"Dataset path not found: {local_dataset_path}"
                     self.log(err, level="ERROR")
                     self._current_status = "ERROR"
                     return False
 
-                self.log(f"Mapping dataset: {dataset_path}...")
-                token_array = np.load(dataset_path, mmap_mode="r")
+                self.log(f"Mapping dataset: {local_dataset_path}...")
+                token_array = np.load(local_dataset_path, mmap_mode="r")
                 vocab_size = int(model_config.get("vocab_size", 0) or 0)
 
                 if vocab_size <= 0:
@@ -500,20 +800,10 @@ class ClusterWorker:
                 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
                 dataloader_iter = iter(dataloader)
 
-                # Prepare validation dataset if available alongside train tokens
-                val_dataset_path = job.get("val_dataset_path")
-                if not val_dataset_path or not os.path.exists(val_dataset_path):
-                    cand_val = Path(dataset_path).parent / "val_tokens.npy"
-                    if cand_val.exists():
-                        val_dataset_path = str(cand_val)
-                    else:
-                        cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
-                        if cand_shared_val.exists():
-                            val_dataset_path = str(cand_shared_val)
-
-                if val_dataset_path and os.path.exists(val_dataset_path):
+                # 5. Prepare validation dataset if available alongside train tokens
+                if local_val_dataset_path and os.path.exists(local_val_dataset_path):
                     try:
-                        val_token_array = np.load(val_dataset_path, mmap_mode="r")
+                        val_token_array = np.load(local_val_dataset_path, mmap_mode="r")
                         if len(val_token_array) > context_length:
                             val_dataset = ShardedTokenDataset(
                                 token_array=val_token_array,
@@ -527,7 +817,7 @@ class ClusterWorker:
                     except Exception as e:
                         self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
 
-                # Build model and optimizer
+                # 6. Build model and optimizer
                 self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str, logger=self.log)
                 self.log(f"Model ready. Creating AdamW optimizer (lr={lr})...")
@@ -670,8 +960,32 @@ class ClusterWorker:
             self._current_status = "COMPLETED"
             self._current_job_id = None
             self.log(f"Job {job_id} successfully completed all {max_rounds} rounds.")
-            return True
+        except BaseException as exc:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"CRITICAL: Job execution crashed with unhandled exception:\n{tb}", level="ERROR")
+            self._current_status = "ERROR"
+            raise
         finally:
+            # Terminate and reap auxiliary worker subprocesses (primary worker only)
+            if self._child_worker_procs:
+                self.log(f"Cleaning up {len(self._child_worker_procs)} auxiliary worker process(es)...")
+                for proc, aux_wid in self._child_worker_procs:
+                    try:
+                        if proc.poll() is None:
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=3.0)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        self.bus.heartbeat(aux_wid, status="OFFLINE", current_job_id=None)
+                    except Exception:
+                        pass
+                self._child_worker_procs.clear()
+
             try:
                 if model is not None:
                     model.to("cpu")
@@ -895,7 +1209,8 @@ class ClusterWorker:
         # 2. Check target worker filtering if specified by job
         target_workers = job.get("target_workers")
         if target_workers and isinstance(target_workers, list):
-            if self.worker_id not in target_workers:
+            base_id = self.worker_id.split("_slot")[0]
+            if self.worker_id not in target_workers and base_id not in target_workers:
                 return False, f"Worker ID '{self.worker_id}' is not in job target_workers list: {target_workers}."
 
         # 3. Check compute device & PyTorch CUDA kernel execution
@@ -973,12 +1288,14 @@ class ClusterWorker:
         device_tag = get_device_tag(self.device_str)
         wid_tag = f"wid_{self.worker_id}"
         if not getattr(self, "_lock_acquired", False):
-            if not acquire_singleton_lock(device_tag):
-                self.log(f"A worker is already running for device '{self.device_str}' on this machine. Exiting.", level="WARNING")
-                return
+            if not self.allow_shared_device:
+                if not acquire_singleton_lock(device_tag):
+                    self.log(f"A worker is already running for device '{self.device_str}' on this machine. Exiting.", level="WARNING")
+                    return
 
             if not acquire_singleton_lock(wid_tag):
-                release_singleton_lock(device_tag)
+                if not self.allow_shared_device:
+                    release_singleton_lock(device_tag)
                 self.log(f"A worker is already running for worker ID '{self.worker_id}' on this machine. Exiting.", level="WARNING")
                 return
             self._lock_acquired = True
@@ -999,6 +1316,37 @@ class ClusterWorker:
                 self._stop_event.wait(poll_interval)
             return
 
+        # Dedicated execution loop for ephemeral auxiliary worker processes
+        if self.ephemeral_job_id:
+            self.log(f"Ephemeral worker slot started for job '{self.ephemeral_job_id}'. Will exit automatically upon completion.")
+            try:
+                deadline = time.time() + 45.0
+                while not self._stop_event.is_set() and time.time() < deadline:
+                    active_job = self.bus.get_active_job()
+                    if active_job and active_job.get("job_id") == self.ephemeral_job_id and active_job.get("status") in {"RUNNING", "QUEUED"}:
+                        self.execute_job(active_job, poll_interval=poll_interval)
+                        break
+                    time.sleep(poll_interval)
+            except BaseException as exc:
+                import traceback
+                tb = traceback.format_exc()
+                self.log(f"CRITICAL: Ephemeral worker crashed with unhandled exception:\n{tb}", level="ERROR")
+                print(f"\n[Worker CRITICAL TRACEBACK]\n{tb}", file=sys.stderr, flush=True)
+                raise
+            finally:
+                if not self.allow_shared_device:
+                    release_singleton_lock(device_tag)
+                release_singleton_lock(wid_tag)
+                self._current_status = "OFFLINE"
+                self._current_job_id = None
+                try:
+                    self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
+                except Exception:
+                    pass
+                self.log(f"Ephemeral worker slot {self.worker_id} finished execution. Exiting process.")
+                return
+
+        # Persistent daemon loop for primary worker daemon
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         try:
             while not self._stop_event.is_set():
@@ -1027,8 +1375,15 @@ class ClusterWorker:
                     time.sleep(poll_interval * 2)
 
                 self._stop_event.wait(poll_interval)
+        except BaseException as exc:
+            import traceback
+            tb = traceback.format_exc()
+            self.log(f"CRITICAL: Worker daemon crashed with unhandled exception:\n{tb}", level="ERROR")
+            print(f"\n[Worker CRITICAL TRACEBACK]\n{tb}", file=sys.stderr, flush=True)
+            raise
         finally:
-            release_singleton_lock(device_tag)
+            if not self.allow_shared_device:
+                release_singleton_lock(device_tag)
             release_singleton_lock(wid_tag)
             self._current_status = "OFFLINE"
             self._current_job_id = None
