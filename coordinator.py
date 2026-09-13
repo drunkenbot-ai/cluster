@@ -6,6 +6,7 @@ cross-round progression with straggler timeouts.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Callable, Optional
 
@@ -67,6 +68,8 @@ class ClusterCoordinator:
         """
         self.bus = bus
         self.job_id = job_id
+        self._cumulative_tokens: int = 0
+        self._dataset_tokens: Optional[int] = None
 
     def wait_and_average_round(
         self,
@@ -186,6 +189,31 @@ class ClusterCoordinator:
         is_final_round = (round_num + 1 >= max_rounds)
         self.bus.save_checkpoint(self.job_id, effective_step, global_state, is_final=is_final_round)
 
+        # Determine total dataset tokens if not yet cached
+        if self._dataset_tokens is None:
+            ds_path = job.get("dataset_path")
+            if ds_path and os.path.exists(ds_path):
+                try:
+                    import numpy as np
+                    arr = np.load(ds_path, mmap_mode="r")
+                    self._dataset_tokens = int(len(arr))
+                except Exception:
+                    self._dataset_tokens = None
+
+        self._cumulative_tokens += total_tokens_round
+        epoch_float = None
+        if self._dataset_tokens and self._dataset_tokens > 0:
+            epoch_float = round(self._cumulative_tokens / self._dataset_tokens, 4)
+
+        tcfg = job.get("training_config", {})
+        if isinstance(tcfg, str):
+            try:
+                import json
+                tcfg = json.loads(tcfg)
+            except Exception:
+                tcfg = {}
+        target_epochs = int(tcfg.get("epochs") or 1)
+
         summary_metrics = {
             "job_id": self.job_id,
             "round": round_num,
@@ -195,6 +223,10 @@ class ClusterCoordinator:
             "val_loss": global_val_loss,
             "aggregate_tokens_per_sec": round(aggregate_tokens_sec, 1),
             "total_tokens_round": total_tokens_round,
+            "cumulative_tokens": self._cumulative_tokens,
+            "dataset_tokens": self._dataset_tokens,
+            "epoch": epoch_float,
+            "target_epochs": target_epochs,
             "ready_workers_count": len(ready_workers),
             "participating_workers": ready_workers,
             "worker_losses": {wid: round(float(t.get("avg_loss", 0.0)), 4) for wid, t in worker_telemetries.items()},
