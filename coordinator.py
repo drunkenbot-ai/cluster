@@ -6,7 +6,9 @@ cross-round progression with straggler timeouts.
 
 from __future__ import annotations
 
+import json
 import os
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -189,6 +191,62 @@ class ClusterCoordinator:
         is_final_round = (round_num + 1 >= max_rounds)
         self.bus.save_checkpoint(self.job_id, effective_step, global_state, is_final=is_final_round)
 
+        if is_final_round:
+            ckpt_dir = self.bus.get_checkpoints_dir(self.job_id)
+            peft_m = str(job.get("peft_method") or "none").lower()
+            if peft_m == "lora":
+                adapters = {k: v for k, v in global_state.items() if ".lora_a" in k or ".lora_b" in k}
+                if adapters:
+                    adapter_target = ckpt_dir / "adapter_model.pt"
+                    torch.save({"adapter_state_dict": adapters, "lora_config": job.get("lora_config")}, adapter_target)
+                try:
+                    m_cfg = job.get("model_config", {})
+                    if isinstance(m_cfg, str):
+                        m_cfg = json.loads(m_cfg)
+                    from cluster.worker import build_model_from_config, apply_lora_adapters, merged_lora_state_dict
+                    m_temp = build_model_from_config(m_cfg, "cpu")
+                    l_cfg = job.get("lora_config") or {}
+                    if isinstance(l_cfg, str):
+                        l_cfg = json.loads(l_cfg)
+                    apply_lora_adapters(
+                        m_temp,
+                        rank=int(l_cfg.get("rank", 8)),
+                        alpha=float(l_cfg.get("alpha", 16.0)),
+                        dropout=float(l_cfg.get("dropout", 0.0)),
+                        target_modules=str(l_cfg.get("target_modules", "attention")),
+                    )
+                    m_temp.load_state_dict(global_state, strict=False)
+                    merged = merged_lora_state_dict(m_temp)
+                    torch.save({"model_state_dict": merged, "model_config": m_cfg}, ckpt_dir / "final_model_merged.pt")
+                except Exception:
+                    pass
+
+            try:
+                tcfg_raw = job.get("training_config", {})
+                tcfg_dict = json.loads(tcfg_raw) if isinstance(tcfg_raw, str) else dict(tcfg_raw or {})
+                summary_data = {
+                    "job_id": self.job_id,
+                    "job_type": job.get("job_type", "pretrain"),
+                    "completed_at": time.time(),
+                    "total_rounds": round_num + 1,
+                    "final_loss": round(global_avg_loss, 4),
+                    "final_val_loss": global_val_loss,
+                    "model_config": job.get("model_config"),
+                    "training_config": tcfg_dict,
+                    "peft_method": peft_m,
+                    "lora_config": job.get("lora_config"),
+                    "base_checkpoint_path": job.get("base_checkpoint_path"),
+                }
+                (ckpt_dir / "training_summary.json").write_text(json.dumps(summary_data, indent=2, default=str), encoding="utf-8")
+                lineage_data = {
+                    "base_checkpoint": job.get("base_checkpoint_path"),
+                    "training_mode": job.get("job_type", "pretrain"),
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+                }
+                (ckpt_dir / "model_lineage.json").write_text(json.dumps(lineage_data, indent=2, default=str), encoding="utf-8")
+            except Exception as exc:
+                print(f"[Coordinator summary export failed]: {exc}")
+
         # Determine total dataset tokens if not yet cached
         if self._dataset_tokens is None:
             ds_path = job.get("dataset_path")
@@ -208,7 +266,6 @@ class ClusterCoordinator:
         tcfg = job.get("training_config", {})
         if isinstance(tcfg, str):
             try:
-                import json
                 tcfg = json.loads(tcfg)
             except Exception:
                 tcfg = {}

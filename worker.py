@@ -496,6 +496,113 @@ def build_model_from_config(
         return FallbackLM().to(device)
 
 
+# -----------------------------------------------------------------------------
+# Parameter-Efficient Fine-Tuning (LoRA) Support
+# -----------------------------------------------------------------------------
+
+try:
+    from engine.model_norm_lora import (
+        LoRALinear,
+        apply_lora_adapters,
+        freeze_non_lora_parameters,
+        lora_state_dict,
+        merged_lora_state_dict,
+    )
+except ImportError:
+    import math
+
+    class LoRALinear(nn.Module):
+        """Linear layer with trainable low-rank LoRA adapters."""
+        def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float = 0.0) -> None:
+            super().__init__()
+            self.base = base
+            self.rank = rank
+            self.alpha = alpha
+            self.scaling = alpha / rank
+            self.dropout = nn.Dropout(dropout)
+            self.lora_a = nn.Parameter(torch.zeros(rank, base.in_features, device=base.weight.device, dtype=base.weight.dtype))
+            self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device, dtype=base.weight.dtype))
+            nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_b)
+            self.base.weight.requires_grad_(False)
+            if self.base.bias is not None:
+                self.base.bias.requires_grad_(False)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            update = F.linear(F.linear(self.dropout(value), self.lora_a), self.lora_b) * self.scaling
+            return self.base(value) + update
+
+    def _set_nested_module(root: nn.Module, module_name: str, module: nn.Module) -> None:
+        parent_name, child_name = module_name.rsplit(".", 1) if "." in module_name else ("", module_name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, module)
+
+    def _lora_target_names(model: nn.Module, target_modules: str) -> set[str]:
+        groups = {part.strip().lower() for part in target_modules.split(",") if part.strip()}
+        if "all" in groups:
+            groups.update({"attention", "mlp"})
+        names: set[str] = set()
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            if name.endswith("lm_head"):
+                continue
+            is_attention = ".attn." in name or "attn" in name or "attention" in name
+            is_mlp = ".mlp." in name or "mlp" in name
+            if ("attention" in groups and is_attention) or ("mlp" in groups and is_mlp):
+                names.add(name)
+        return names
+
+    def apply_lora_adapters(model: nn.Module, rank: int, alpha: float, dropout: float, target_modules: str) -> int:
+        names = _lora_target_names(model, target_modules)
+        for name in sorted(names):
+            try:
+                module = model.get_submodule(name)
+                if isinstance(module, nn.Linear):
+                    _set_nested_module(model, name, LoRALinear(module, rank, alpha, dropout))
+            except Exception:
+                pass
+        return len(names)
+
+    def freeze_non_lora_parameters(model: nn.Module) -> None:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(("lora_a" in name) or ("lora_b" in name))
+
+    def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+            if ".lora_a" in name or ".lora_b" in name
+        }
+
+    def merged_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+        replacements: dict[str, tuple[str, torch.Tensor]] = {}
+        adapter_keys: set[str] = set()
+        for module_name, module in model.named_modules():
+            if not isinstance(module, LoRALinear):
+                continue
+            prefix = f"{module_name}."
+            replacements[f"{prefix}base.weight"] = (
+                f"{prefix}weight",
+                module.base.weight.detach() + (module.lora_b.detach() @ module.lora_a.detach()) * module.scaling,
+            )
+            if module.base.bias is not None:
+                replacements[f"{prefix}base.bias"] = (
+                    f"{prefix}bias",
+                    module.base.bias.detach(),
+                )
+            adapter_keys.update({f"{prefix}lora_a", f"{prefix}lora_b"})
+        merged: dict[str, torch.Tensor] = {}
+        for name, tensor in model.state_dict().items():
+            replacement = replacements.get(name)
+            if replacement is not None:
+                target_name, value = replacement
+                merged[target_name] = value.cpu()
+            elif name not in adapter_keys:
+                merged[name] = tensor.detach().cpu()
+        return merged
+
+
 class ClusterWorker:
     """Worker daemon executing distributed Local SGD rounds on a worker node."""
 
@@ -994,9 +1101,41 @@ class ClusterWorker:
                 # 6. Build model and optimizer
                 self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str, logger=self.log)
-                self.log(f"Model ready. Creating AdamW optimizer (lr={lr})...")
+
+                # Check if this is a fine-tuning job and load base model weights
+                job_type = str(job.get("job_type") or training_config.get("training_mode") or "pretrain").lower()
+                is_fine_tune = (job_type == "fine_tune")
+
+                if is_fine_tune:
+                    self.log("Fine-tuning job detected. Loading base checkpoint weights from shared storage...")
+                    base_weights = self.bus.load_base_model_weights(job_id, device=self.device_str)
+                    if base_weights is not None:
+                        try:
+                            missing, unexpected = model.load_state_dict(base_weights, strict=False)
+                            self.log(f"Base model weights loaded successfully for fine-tuning. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
+                        except Exception as e:
+                            self.log(f"Warning: Failed to load some base weights: {e}", level="WARNING")
+                    else:
+                        self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+
+                # Apply LoRA if configured
+                peft_method = str(job.get("peft_method") or training_config.get("peft_method") or "none").lower()
+                if peft_method == "lora":
+                    lora_cfg = job.get("lora_config") or training_config.get("lora_config") or {}
+                    l_rank = int(lora_cfg.get("rank", training_config.get("lora_rank", 8)))
+                    l_alpha = float(lora_cfg.get("alpha", training_config.get("lora_alpha", 16.0)))
+                    l_dropout = float(lora_cfg.get("dropout", training_config.get("lora_dropout", 0.05)))
+                    l_targets = str(lora_cfg.get("target_modules", training_config.get("lora_target_modules", "attention")))
+                    num_lora = apply_lora_adapters(model, rank=l_rank, alpha=l_alpha, dropout=l_dropout, target_modules=l_targets)
+                    freeze_non_lora_parameters(model)
+                    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                    self.log(f"LoRA adapters applied to {num_lora} modules. Trainable parameters: {trainable_params:,} (base model frozen).")
+
+                # Create optimizer only over trainable parameters
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                self.log(f"Model ready. Creating AdamW optimizer for {len(trainable_params)} tensor(s) (lr={lr})...")
                 t_opt = time.time()
-                optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+                optimizer = torch.optim.AdamW(trainable_params, lr=lr)
                 self.log(f"Optimizer created in {time.time() - t_opt:.2f}s on '{self.device_str}'. Ready to train {max_rounds} rounds.")
             except Exception as exc:
                 import traceback

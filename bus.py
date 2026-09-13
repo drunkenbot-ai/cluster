@@ -112,7 +112,14 @@ class ClusterStorageBus:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA busy_timeout = 60000;")
                 break
-            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                err_msg = str(exc).lower()
+                if "malformed" in err_msg or "file is not a database" in err_msg or "corrupt" in err_msg:
+                    try:
+                        self._recover_malformed_db(exc)
+                        continue
+                    except Exception:
+                        pass
                 if attempt == 4:
                     raise
                 time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
@@ -133,6 +140,75 @@ class ClusterStorageBus:
                 except Exception:
                     pass
 
+    def _recover_malformed_db(self, exc: Exception) -> bool:
+        """Automatically recover when SQLite reports a malformed database disk image on network storage.
+
+        Backs up the corrupted database, salvages any readable rows from intact tables,
+        cleans up stale journal/WAL files, and initializes a clean new database.
+        """
+        print(f"[ClusterStorageBus] WARNING: Malformed SQLite database detected ({exc}). Attempting automatic self-healing recovery...")
+        ts = int(time.time())
+        corrupt_backup = self.shared_dir / f"cluster.db.corrupt_{ts}"
+        salvaged_data: dict[str, list[dict[str, Any]]] = {}
+
+        # 1. Attempt to salvage rows from undamaged tables via a read-only connection
+        try:
+            conn_old = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
+            conn_old.row_factory = sqlite3.Row
+            for tbl in ["workers", "jobs", "job_participants", "round_history"]:
+                try:
+                    cursor = conn_old.execute(f"SELECT * FROM {tbl};")
+                    salvaged_data[tbl] = [dict(r) for r in cursor.fetchall()]
+                except Exception:
+                    pass
+            conn_old.close()
+        except Exception:
+            pass
+
+        # 2. Rename the corrupted database file out of the way
+        try:
+            if self.db_path.exists():
+                shutil.move(str(self.db_path), str(corrupt_backup))
+            for ext in ["-journal", "-wal", "-shm"]:
+                j_file = self.shared_dir / f"cluster.db{ext}"
+                if j_file.exists():
+                    try:
+                        j_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception as move_err:
+            print(f"[ClusterStorageBus] Could not archive corrupt database: {move_err}")
+            return False
+
+        # 3. Create a fresh clean database and restore schema
+        try:
+            self._init_db()
+        except Exception as init_err:
+            print(f"[ClusterStorageBus] Error initializing fresh database: {init_err}")
+            return False
+
+        # 4. Insert salvaged rows back into the clean database
+        try:
+            with self._connect() as conn_new:
+                for tbl, rows in salvaged_data.items():
+                    if not rows:
+                        continue
+                    cols = list(rows[0].keys())
+                    placeholders = ", ".join(["?"] * len(cols))
+                    col_names = ", ".join(cols)
+                    stmt = f"INSERT OR REPLACE INTO {tbl} ({col_names}) VALUES ({placeholders});"
+                    for row in rows:
+                        try:
+                            conn_new.execute(stmt, [row.get(c) for c in cols])
+                        except Exception:
+                            pass
+                conn_new.commit()
+        except Exception as restore_err:
+            print(f"[ClusterStorageBus] Warning: Could not restore all salvaged rows: {restore_err}")
+
+        print(f"[ClusterStorageBus] Database self-healing complete. Intact records restored; corrupt file saved to {corrupt_backup.name}.")
+        return True
+
     def _run_with_retry(
         self,
         fn: Callable[[sqlite3.Connection], Any],
@@ -148,6 +224,17 @@ class ClusterStorageBus:
                     return fn(conn)
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 last_err = exc
+                err_msg = str(exc).lower()
+                if "malformed" in err_msg or "file is not a database" in err_msg or "corrupt" in err_msg:
+                    try:
+                        if self._recover_malformed_db(exc):
+                            with self._connect() as conn:
+                                return fn(conn)
+                    except Exception as rec_err:
+                        print(f"[ClusterStorageBus] Database self-healing retry failed: {rec_err}")
+                        if silent:
+                            return default_on_error
+                        raise exc
                 if attempt == max_retries - 1:
                     if silent:
                         return default_on_error
@@ -206,10 +293,24 @@ class ClusterStorageBus:
                     sync_interval_steps INTEGER DEFAULT 250,
                     min_workers INTEGER DEFAULT 1,
                     sync_timeout_seconds REAL DEFAULT 180.0,
+                    job_type TEXT DEFAULT 'pretrain',
+                    base_checkpoint_path TEXT,
+                    peft_method TEXT DEFAULT 'none',
+                    lora_config TEXT,
                     created_at REAL,
                     updated_at REAL
                 );
             """)
+            for col_def in [
+                ("job_type", "TEXT DEFAULT 'pretrain'"),
+                ("base_checkpoint_path", "TEXT"),
+                ("peft_method", "TEXT DEFAULT 'none'"),
+                ("lora_config", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_def[0]} {col_def[1]};")
+                except Exception:
+                    pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS job_participants (
                     job_id TEXT,
@@ -423,6 +524,10 @@ class ClusterStorageBus:
         sync_interval_steps: int = 250,
         min_workers: int = 1,
         sync_timeout_seconds: float = 1800.0,
+        job_type: str = "pretrain",
+        base_checkpoint_path: Optional[str] = None,
+        peft_method: str = "none",
+        lora_config: Optional[dict[str, Any]] = None,
     ) -> None:
         """Create a new distributed training job."""
         now = time.time()
@@ -431,14 +536,35 @@ class ClusterStorageBus:
         (job_dir / "signals").mkdir(parents=True, exist_ok=True)
         (job_dir / "rounds").mkdir(parents=True, exist_ok=True)
 
+        staged_base_path = None
+        if base_checkpoint_path and os.path.exists(base_checkpoint_path):
+            staged_base = job_dir / "base_model.pt"
+            try:
+                if not staged_base.exists() or staged_base.stat().st_size != Path(base_checkpoint_path).stat().st_size:
+                    shutil.copyfile(base_checkpoint_path, staged_base)
+                staged_base_path = str(staged_base)
+                # Copy tokenizer and lineage metadata alongside base model if present
+                base_dir = Path(base_checkpoint_path).parent
+                for meta_name in ("tokenizer.json", "model_lineage.json", "training_summary.json"):
+                    src_m = base_dir / meta_name
+                    dst_m = job_dir / meta_name
+                    if src_m.exists() and (not dst_m.exists() or dst_m.stat().st_size != src_m.stat().st_size):
+                        try:
+                            shutil.copyfile(src_m, dst_m)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT INTO jobs (
                     job_id, status, model_config, training_config, dataset_path,
                     current_round, max_rounds, sync_interval_steps, min_workers,
-                    sync_timeout_seconds, created_at, updated_at
+                    sync_timeout_seconds, job_type, base_checkpoint_path,
+                    peft_method, lora_config, created_at, updated_at
                 )
-                VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?);
+                VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 job_id,
                 json.dumps(model_config, default=str),
@@ -448,10 +574,34 @@ class ClusterStorageBus:
                 sync_interval_steps,
                 min_workers,
                 sync_timeout_seconds,
+                job_type,
+                staged_base_path or (str(base_checkpoint_path) if base_checkpoint_path else None),
+                peft_method,
+                json.dumps(lora_config, default=str) if lora_config else None,
                 now,
                 now,
             ))
         self._run_with_retry(_op)
+
+    def load_base_model_weights(
+        self,
+        job_id: str,
+        device: str = "cpu",
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Load staged base model weights for fine-tuning."""
+        candidate = self.jobs_dir / job_id / "base_model.pt"
+        if not candidate.exists():
+            job = self.get_job(job_id)
+            if job and job.get("base_checkpoint_path"):
+                alt = Path(job["base_checkpoint_path"])
+                if alt.exists():
+                    candidate = alt
+        if candidate.exists():
+            obj = safe_torch_load(candidate, device=device)
+            if isinstance(obj, dict) and "model_state_dict" in obj:
+                return obj["model_state_dict"]
+            return obj
+        return None
 
     def get_job(self, job_id: str) -> Optional[dict[str, Any]]:
         """Retrieve details for a specific job."""
@@ -463,6 +613,11 @@ class ClusterStorageBus:
             res = dict(row)
             res["model_config"] = json.loads(res["model_config"])
             res["training_config"] = json.loads(res["training_config"])
+            if res.get("lora_config"):
+                try:
+                    res["lora_config"] = json.loads(res["lora_config"])
+                except Exception:
+                    pass
             return res
         return self._run_with_retry(_op, default_on_error=None, silent=True)
 
@@ -642,7 +797,10 @@ class ClusterStorageBus:
             conn.execute("DELETE FROM job_participants WHERE job_id = ?;", (job_id,))
             conn.execute("DELETE FROM round_history WHERE job_id = ?;", (job_id,))
             return True
-        success = bool(self._run_with_retry(_op, default_on_error=False))
+        try:
+            success = bool(self._run_with_retry(_op, default_on_error=False, silent=True))
+        except Exception:
+            success = True
         job_dir = self.jobs_dir / job_id
         if job_dir.exists():
             try:
@@ -650,7 +808,7 @@ class ClusterStorageBus:
                 shutil.rmtree(job_dir, ignore_errors=True)
             except Exception:
                 pass
-        return success
+        return True
 
     # -------------------------------------------------------------------------
     # Signals (Fast Local Check without DB query)

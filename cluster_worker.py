@@ -612,7 +612,14 @@ class StandaloneStorageBus:
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA busy_timeout = 60000;")
                 break
-            except (sqlite3.OperationalError, sqlite3.DatabaseError):
+            except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+                err_msg = str(exc).lower()
+                if "malformed" in err_msg or "file is not a database" in err_msg or "corrupt" in err_msg:
+                    try:
+                        self._recover_malformed_db(exc)
+                        continue
+                    except Exception:
+                        pass
                 if attempt == 4:
                     raise
                 time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
@@ -633,6 +640,67 @@ class StandaloneStorageBus:
                 except Exception:
                     pass
 
+    def _recover_malformed_db(self, exc: Exception) -> bool:
+        """Automatically recover when SQLite reports a malformed database disk image on network storage."""
+        print(f"[StandaloneStorageBus] WARNING: Corrupted/malformed SQLite database detected ({exc}). Attempting automatic self-healing recovery...")
+        ts = int(time.time())
+        corrupt_backup = self.shared_dir / f"cluster.db.corrupt_{ts}"
+        salvaged_data: dict[str, list[dict[str, Any]]] = {}
+
+        try:
+            conn_old = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
+            conn_old.row_factory = sqlite3.Row
+            for tbl in ["workers", "jobs", "job_participants", "round_history"]:
+                try:
+                    cursor = conn_old.execute(f"SELECT * FROM {tbl};")
+                    salvaged_data[tbl] = [dict(r) for r in cursor.fetchall()]
+                except Exception:
+                    pass
+            conn_old.close()
+        except Exception:
+            pass
+
+        try:
+            if self.db_path.exists():
+                shutil.move(str(self.db_path), str(corrupt_backup))
+            for ext in ["-journal", "-wal", "-shm"]:
+                j_file = self.shared_dir / f"cluster.db{ext}"
+                if j_file.exists():
+                    try:
+                        j_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception as move_err:
+            print(f"[StandaloneStorageBus] Could not archive corrupt database: {move_err}")
+            return False
+
+        try:
+            self._init_db()
+        except Exception as init_err:
+            print(f"[StandaloneStorageBus] Error initializing fresh database: {init_err}")
+            return False
+
+        try:
+            with self._connect() as conn_new:
+                for tbl, rows in salvaged_data.items():
+                    if not rows:
+                        continue
+                    cols = list(rows[0].keys())
+                    placeholders = ", ".join(["?"] * len(cols))
+                    col_names = ", ".join(cols)
+                    stmt = f"INSERT OR REPLACE INTO {tbl} ({col_names}) VALUES ({placeholders});"
+                    for row in rows:
+                        try:
+                            conn_new.execute(stmt, [row.get(c) for c in cols])
+                        except Exception:
+                            pass
+                conn_new.commit()
+        except Exception as restore_err:
+            print(f"[StandaloneStorageBus] Warning: Could not restore all salvaged rows: {restore_err}")
+
+        print(f"[StandaloneStorageBus] Database self-healing complete. Intact records restored; corrupt file saved to {corrupt_backup.name}.")
+        return True
+
     def _run_with_retry(
         self,
         fn: Callable[[sqlite3.Connection], Any],
@@ -648,6 +716,17 @@ class StandaloneStorageBus:
                     return fn(conn)
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 last_err = exc
+                err_msg = str(exc).lower()
+                if "malformed" in err_msg or "file is not a database" in err_msg or "corrupt" in err_msg:
+                    try:
+                        if self._recover_malformed_db(exc):
+                            with self._connect() as conn:
+                                return fn(conn)
+                    except Exception as rec_err:
+                        print(f"[StandaloneStorageBus] Database self-healing retry failed: {rec_err}")
+                        if silent:
+                            return default_on_error
+                        raise exc
                 if attempt == max_retries - 1:
                     if silent:
                         return default_on_error
@@ -1016,6 +1095,22 @@ class StandaloneStorageBus:
         weight_path = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / "global_model.pt"
         return safe_torch_load(weight_path, device=device)
 
+    def load_base_model_weights(self, job_id: str, device: str = "cpu") -> Optional[dict[str, torch.Tensor]]:
+        """Load staged base model weights for fine-tuning."""
+        candidate = self.jobs_dir / job_id / "base_model.pt"
+        if not candidate.exists():
+            job = self.get_active_job()
+            if job and job.get("job_id") == job_id and job.get("base_checkpoint_path"):
+                alt = Path(job["base_checkpoint_path"])
+                if alt.exists():
+                    candidate = alt
+        if candidate.exists():
+            obj = safe_torch_load(candidate, device=device)
+            if isinstance(obj, dict) and "model_state_dict" in obj:
+                return obj["model_state_dict"]
+            return obj
+        return None
+
 
 
 
@@ -1318,6 +1413,111 @@ def build_worker_model(model_config: dict[str, Any], device: str) -> nn.Module:
         return MicroGPT(ModelConfig(**filtered)).to(device)
     except Exception:
         return StandaloneMicroGPT(model_config).to(device)
+
+
+# -----------------------------------------------------------------------------
+# Parameter-Efficient Fine-Tuning (LoRA) Support
+# -----------------------------------------------------------------------------
+
+try:
+    from engine.model_norm_lora import (
+        LoRALinear,
+        apply_lora_adapters,
+        freeze_non_lora_parameters,
+        lora_state_dict,
+        merged_lora_state_dict,
+    )
+except ImportError:
+    class LoRALinear(nn.Module):
+        """Linear layer with trainable low-rank LoRA adapters."""
+        def __init__(self, base: nn.Linear, rank: int, alpha: float, dropout: float = 0.0) -> None:
+            super().__init__()
+            self.base = base
+            self.rank = rank
+            self.alpha = alpha
+            self.scaling = alpha / rank
+            self.dropout = nn.Dropout(dropout)
+            self.lora_a = nn.Parameter(torch.zeros(rank, base.in_features, device=base.weight.device, dtype=base.weight.dtype))
+            self.lora_b = nn.Parameter(torch.zeros(base.out_features, rank, device=base.weight.device, dtype=base.weight.dtype))
+            nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_b)
+            self.base.weight.requires_grad_(False)
+            if self.base.bias is not None:
+                self.base.bias.requires_grad_(False)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            update = F.linear(F.linear(self.dropout(value), self.lora_a), self.lora_b) * self.scaling
+            return self.base(value) + update
+
+    def _set_nested_module(root: nn.Module, module_name: str, module: nn.Module) -> None:
+        parent_name, child_name = module_name.rsplit(".", 1) if "." in module_name else ("", module_name)
+        parent = root.get_submodule(parent_name) if parent_name else root
+        setattr(parent, child_name, module)
+
+    def _lora_target_names(model: nn.Module, target_modules: str) -> set[str]:
+        groups = {part.strip().lower() for part in target_modules.split(",") if part.strip()}
+        if "all" in groups:
+            groups.update({"attention", "mlp"})
+        names: set[str] = set()
+        for name, module in model.named_modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            if name.endswith("lm_head"):
+                continue
+            is_attention = ".attn." in name or "attn" in name or "attention" in name
+            is_mlp = ".mlp." in name or "mlp" in name
+            if ("attention" in groups and is_attention) or ("mlp" in groups and is_mlp):
+                names.add(name)
+        return names
+
+    def apply_lora_adapters(model: nn.Module, rank: int, alpha: float, dropout: float, target_modules: str) -> int:
+        names = _lora_target_names(model, target_modules)
+        for name in sorted(names):
+            try:
+                module = model.get_submodule(name)
+                if isinstance(module, nn.Linear):
+                    _set_nested_module(model, name, LoRALinear(module, rank, alpha, dropout))
+            except Exception:
+                pass
+        return len(names)
+
+    def freeze_non_lora_parameters(model: nn.Module) -> None:
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(("lora_a" in name) or ("lora_b" in name))
+
+    def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+        return {
+            name: tensor.detach().cpu()
+            for name, tensor in model.state_dict().items()
+            if ".lora_a" in name or ".lora_b" in name
+        }
+
+    def merged_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+        replacements: dict[str, tuple[str, torch.Tensor]] = {}
+        adapter_keys: set[str] = set()
+        for module_name, module in model.named_modules():
+            if not isinstance(module, LoRALinear):
+                continue
+            prefix = f"{module_name}."
+            replacements[f"{prefix}base.weight"] = (
+                f"{prefix}weight",
+                module.base.weight.detach() + (module.lora_b.detach() @ module.lora_a.detach()) * module.scaling,
+            )
+            if module.base.bias is not None:
+                replacements[f"{prefix}base.bias"] = (
+                    f"{prefix}bias",
+                    module.base.bias.detach(),
+                )
+            adapter_keys.update({f"{prefix}lora_a", f"{prefix}lora_b"})
+        merged: dict[str, torch.Tensor] = {}
+        for name, tensor in model.state_dict().items():
+            replacement = replacements.get(name)
+            if replacement is not None:
+                target_name, value = replacement
+                merged[target_name] = value.cpu()
+            elif name not in adapter_keys:
+                merged[name] = tensor.detach().cpu()
+        return merged
 
 
 def collect_system_metrics(device_str: str = "cpu", total_vram_gb: float = 0.0) -> dict[str, Any]:
@@ -1728,8 +1928,39 @@ class StandaloneWorker:
                     self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
 
             model = build_worker_model(model_cfg, self.device_str)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-            self.log(f"Initialized model for {self.worker_id} on {self.device_str}. Ready to train.")
+
+            # Check if this is a fine-tuning job and load base model weights
+            job_type = str(job.get("job_type") or training_cfg.get("training_mode") or "pretrain").lower()
+            is_fine_tune = (job_type == "fine_tune")
+
+            if is_fine_tune:
+                self.log("Fine-tuning job detected. Loading base checkpoint weights from shared storage...")
+                base_weights = self.bus.load_base_model_weights(job_id, device=self.device_str)
+                if base_weights is not None:
+                    try:
+                        missing, unexpected = model.load_state_dict(base_weights, strict=False)
+                        self.log(f"Base model weights loaded successfully for fine-tuning. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
+                    except Exception as e:
+                        self.log(f"Warning: Failed to load some base weights: {e}", level="WARNING")
+                else:
+                    self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+
+            # Apply LoRA if configured
+            peft_method = str(job.get("peft_method") or training_cfg.get("peft_method") or "none").lower()
+            if peft_method == "lora":
+                lora_cfg = job.get("lora_config") or training_cfg.get("lora_config") or {}
+                l_rank = int(lora_cfg.get("rank", training_cfg.get("lora_rank", 8)))
+                l_alpha = float(lora_cfg.get("alpha", training_cfg.get("lora_alpha", 16.0)))
+                l_dropout = float(lora_cfg.get("dropout", training_cfg.get("lora_dropout", 0.05)))
+                l_targets = str(lora_cfg.get("target_modules", training_cfg.get("lora_target_modules", "attention")))
+                num_lora = apply_lora_adapters(model, rank=l_rank, alpha=l_alpha, dropout=l_dropout, target_modules=l_targets)
+                freeze_non_lora_parameters(model)
+                trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+                self.log(f"LoRA adapters applied to {num_lora} modules. Trainable parameters: {trainable_params:,} (base model frozen).")
+
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+            self.log(f"Initialized model for {self.worker_id} on {self.device_str} ({len(trainable_params)} trainable tensor(s)). Ready to train.")
             self._heartbeat(status="READY", current_job_id=job_id)
         except Exception as exc:
             import traceback
