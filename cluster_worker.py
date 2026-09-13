@@ -608,9 +608,9 @@ class StandaloneStorageBus:
         conn = None
         for attempt in range(5):
             try:
-                conn = sqlite3.connect(str(self.db_path), timeout=60.0, isolation_level="DEFERRED")
+                conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level="DEFERRED")
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout = 60000;")
+                conn.execute("PRAGMA busy_timeout = 5000;")
                 break
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 err_msg = str(exc).lower()
@@ -625,11 +625,13 @@ class StandaloneStorageBus:
                 time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
         try:
             yield conn
-            conn.commit()
+            if conn and conn.in_transaction:
+                conn.commit()
         except Exception:
             if conn:
                 try:
-                    conn.rollback()
+                    if conn.in_transaction:
+                        conn.rollback()
                 except Exception:
                     pass
             raise

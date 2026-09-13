@@ -106,11 +106,11 @@ class ClusterStorageBus:
             try:
                 conn = sqlite3.connect(
                     str(self.db_path),
-                    timeout=60.0,
+                    timeout=5.0,
                     isolation_level="DEFERRED",
                 )
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout = 60000;")
+                conn.execute("PRAGMA busy_timeout = 5000;")
                 break
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 err_msg = str(exc).lower()
@@ -125,11 +125,13 @@ class ClusterStorageBus:
                 time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
         try:
             yield conn
-            conn.commit()
+            if conn and conn.in_transaction:
+                conn.commit()
         except Exception:
             if conn:
                 try:
-                    conn.rollback()
+                    if conn.in_transaction:
+                        conn.rollback()
                 except Exception:
                     pass
             raise
@@ -343,6 +345,7 @@ class ClusterStorageBus:
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid ON worker_logs(worker_id, timestamp);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_logs_wid_id ON worker_logs(worker_id, id DESC);")
         self._run_with_retry(_init)
 
     # -------------------------------------------------------------------------
@@ -732,22 +735,22 @@ class ClusterStorageBus:
                 """,
                 (job_id,),
             )
-            rows = []
-            for r in cursor.fetchall():
-                task = dict(r)
-                round_num = task.get("last_synced_round", 0)
-                round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
-                telem_file = round_dir / f"{task['worker_id']}_telemetry.json"
-                if telem_file.exists():
-                    try:
-                        task["telemetry"] = json.loads(telem_file.read_text(encoding="utf-8"))
-                    except Exception:
-                        task["telemetry"] = {}
-                else:
+            return [dict(r) for r in cursor.fetchall()]
+
+        rows = self._run_with_retry(_op, default_on_error=[])
+        # Read worker telemetry files from disk outside of SQLite connection to avoid holding lock
+        for task in rows:
+            round_num = task.get("last_synced_round", 0)
+            round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
+            telem_file = round_dir / f"{task['worker_id']}_telemetry.json"
+            if telem_file.exists():
+                try:
+                    task["telemetry"] = json.loads(telem_file.read_text(encoding="utf-8"))
+                except Exception:
                     task["telemetry"] = {}
-                rows.append(task)
-            return rows
-        return self._run_with_retry(_op, default_on_error=[])
+            else:
+                task["telemetry"] = {}
+        return rows
 
     def requeue_job(self, job_id: str, reset_rounds: bool = False) -> bool:
         """Re-queue an existing job to allow resuming or re-running."""
