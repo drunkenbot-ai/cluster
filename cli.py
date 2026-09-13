@@ -237,6 +237,27 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_install_startup(args: argparse.Namespace) -> int:
+    """Install or uninstall cluster worker into Windows user Startup folder."""
+    if sys.platform != "win32":
+        print("[InstallStartup] Error: Windows Startup installation is only supported on Windows.")
+        return 1
+
+    from .setup_startup import install_startup, uninstall_startup, check_status, run_now
+    if getattr(args, "uninstall", False):
+        uninstall_startup()
+    elif getattr(args, "status", False):
+        check_status()
+    else:
+        shared = args.shared_dir or r"J:\GPWRG\REF\mumbai\users\ncj\ai\SHARED"
+        working = getattr(args, "working_dir", None) or str(Path(__file__).resolve().parent.parent)
+        install_startup(shared, working, getattr(args, "python", None))
+        if getattr(args, "run_now", False):
+            run_now()
+    return 0
+
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     default_shared = os.environ.get("LLM_SHARED_PATH") or os.environ.get("LLM_SHARED_DIR")
     parser = argparse.ArgumentParser(prog="cluster", description="Distributed Port-Blocked Training Cluster CLI")
@@ -296,6 +317,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_resume.add_argument("--shared-dir", required=True, help="Shared network directory")
     p_resume.add_argument("--job-id", required=True, help="Job identifier")
     p_resume.set_defaults(func=cmd_resume)
+
+    # Windows Startup subcommand (No Admin Required)
+    p_startup = subparsers.add_parser("install-startup", help="Install cluster worker into Windows user Startup folder (no admin required)")
+    p_startup.add_argument("--shared-dir", default=default_shared, help="Shared network directory")
+    p_startup.add_argument("--working-dir", default=None, help="LLM-IDE code directory")
+    p_startup.add_argument("--python", default=None, help="Custom python.exe path")
+    p_startup.add_argument("--uninstall", action="store_true", help="Remove worker launcher from Startup")
+    p_startup.add_argument("--status", action="store_true", help="Check current installation and running status")
+    p_startup.add_argument("--run-now", action="store_true", help="Trigger worker start immediately")
+    p_startup.set_defaults(func=cmd_install_startup)
 
     parsed = parser.parse_args(argv)
     return parsed.func(parsed)
