@@ -294,6 +294,15 @@ def get_worker_respawn_cmd(
             p = Path(cmd[1])
             if p.exists() or Path(p.resolve()).exists():
                 cmd[1] = str(p.resolve())
+        # Ensure critical identity and location arguments are strictly preserved across respawns
+        if "--worker-id" not in cmd and worker_id:
+            cmd.extend(["--worker-id", worker_id])
+        if "--shared-dir" not in cmd and shared_dir:
+            cmd.extend(["--shared-dir", str(shared_dir)])
+        if "--device" not in cmd and device_str:
+            cmd.extend(["--device", device_str])
+        if allow_shared_device and "--allow-shared-device" not in cmd:
+            cmd.append("--allow-shared-device")
         return cmd
 
     # 2. Check if invoked via module
@@ -1745,10 +1754,18 @@ class StandaloneWorker:
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 CREATE_NO_WINDOW = 0x08000000
                 flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
+            log_dir = Path(self.bus.shared_dir) / "logs"
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_path = log_dir / f"{self.worker_id}.log"
+            except Exception:
+                log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
             log_file = open(log_path, "a", encoding="utf-8")
+            root_dir = str(Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent)
             proc = subprocess.Popen(
                 cmd_args,
+                cwd=root_dir,
+                stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=flags,

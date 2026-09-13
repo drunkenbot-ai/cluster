@@ -438,7 +438,9 @@ class ClusterStorageBus:
         for r in rows:
             data = dict(r)
             last_hb = float(data.get("last_heartbeat") or 0)
-            is_fresh = (now - last_hb) < active_within_seconds
+            time_diff = now - last_hb
+            # Allow bidirectional clock skew across networked workstations (up to active_within_seconds behind, or up to 5 min in future)
+            is_fresh = (time_diff < active_within_seconds) and (time_diff > -300.0)
             stored_status = str(data.get("status") or "OFFLINE").upper()
             data["enabled"] = bool(data.get("enabled", 1)) if data.get("enabled") is not None else True
             if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:

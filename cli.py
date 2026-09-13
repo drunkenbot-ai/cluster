@@ -92,11 +92,11 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
     # 1. Enforce per-device singleton lock on this host (unless allow_shared_device is set)
     if not allow_shared:
-        if not acquire_singleton_lock(device_tag):
+        if not acquire_singleton_lock(device_tag, timeout_seconds=5.0):
             return 1
 
     # 2. Enforce per-worker-id singleton lock on this host
-    if wid_tag and not acquire_singleton_lock(wid_tag):
+    if wid_tag and not acquire_singleton_lock(wid_tag, timeout_seconds=5.0):
         if not allow_shared:
             release_singleton_lock(device_tag)
         return 1
