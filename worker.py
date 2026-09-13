@@ -94,6 +94,7 @@ def cache_dataset_to_local(
     remote_path: str,
     log_fn: Optional[Callable[[str], None]] = None,
     keep_files: Optional[set[str]] = None,
+    progress_callback: Optional[Callable[[float, float, float], None]] = None,
 ) -> str:
     """Safely cache remote/network dataset .npy file to fast local SSD storage.
 
@@ -104,6 +105,7 @@ def cache_dataset_to_local(
         remote_path: Path to dataset .npy on network share (SMB/NFS).
         log_fn: Optional logger callable.
         keep_files: Optional set of filenames to preserve during cache cleanup.
+        progress_callback: Optional callback receiving (pct, speed_mb_s, eta_seconds).
 
     Returns:
         Local path to the cached .npy file (or original remote path if caching is skipped/impossible).
@@ -202,15 +204,37 @@ def cache_dataset_to_local(
         log(f"[DatasetCache] Streaming network dataset {remote_file.name} ({remote_size_gb:.2f} GB) to local SSD ({local_file})...")
         t0 = time.time()
 
-        # Safe 4MB buffer chunks to avoid Windows SMB Errno 22 (ERROR_INVALID_PARAMETER)
-        buf_size = 4 * 1024 * 1024
+        # Safe 2MB buffer chunks matching native Windows SMB buffers with live transfer progress
+        buf_size = 2 * 1024 * 1024
+        transferred = 0
+        last_log_time = time.time()
         try:
             with open(str(remote_file), "rb") as src, open(str(temp_file), "wb") as dst:
-                while True:
-                    chunk = src.read(buf_size)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
+                with memoryview(bytearray(buf_size)) as mv:
+                    while True:
+                        n = src.readinto(mv)
+                        if not n:
+                            break
+                        dst.write(mv[:n])
+                        transferred += n
+                        now = time.time()
+                        if now - last_log_time >= 4.0:
+                            pct = (transferred / max(remote_size, 1)) * 100.0
+                            elapsed_cur = max(now - t0, 0.001)
+                            speed_cur = (transferred / (1024 * 1024)) / elapsed_cur
+                            rem_bytes = max(remote_size - transferred, 0)
+                            eta_s = rem_bytes / max(speed_cur * 1024 * 1024, 1)
+                            log(
+                                f"[DatasetCache] Caching {remote_file.name}: "
+                                f"{transferred / (1024**3):.2f}/{remote_size_gb:.2f} GB ({pct:.1f}%) "
+                                f"@ {speed_cur:.1f} MB/s (ETA: {eta_s:.0f}s)"
+                            )
+                            if progress_callback:
+                                try:
+                                    progress_callback(pct, speed_cur, eta_s)
+                                except Exception:
+                                    pass
+                            last_log_time = now
         except OSError as os_err:
             log(f"[DatasetCache] Chunked stream encountered {os_err}, attempting fallback via shutil.copyfile...", level="WARNING")
             shutil.copyfile(str(remote_file), str(temp_file))
@@ -740,11 +764,26 @@ class ClusterWorker:
                 if self.ephemeral_job_id is None:
                     purge_local_dataset_cache(keep_files=target_cache_files, log_fn=self.log)
 
+                def _on_cache_progress(pct: float, speed: float, eta: float) -> None:
+                    self._current_status = f"PREPARING (Caching {pct:.0f}%)"
+
                 # Safely cache remote/network dataset .npy to fast local SSD storage
-                local_dataset_path = cache_dataset_to_local(dataset_path, log_fn=self.log, keep_files=target_cache_files)
+                local_dataset_path = cache_dataset_to_local(
+                    dataset_path,
+                    log_fn=self.log,
+                    keep_files=target_cache_files,
+                    progress_callback=_on_cache_progress,
+                )
+                self._current_status = "PREPARING"
                 local_val_dataset_path = None
                 if val_dataset_path and os.path.exists(val_dataset_path):
-                    local_val_dataset_path = cache_dataset_to_local(val_dataset_path, log_fn=self.log, keep_files=target_cache_files)
+                    local_val_dataset_path = cache_dataset_to_local(
+                        val_dataset_path,
+                        log_fn=self.log,
+                        keep_files=target_cache_files,
+                        progress_callback=_on_cache_progress,
+                    )
+                self._current_status = "PREPARING"
 
                 # 2. Dynamic multi-worker: spawn auxiliary workers if node has excess VRAM (primary daemon only)
                 if self.ephemeral_job_id is None and not self._child_worker_procs:

@@ -361,6 +361,7 @@ def cache_dataset_to_local(
     remote_path: str,
     log_fn: Optional[Callable[[str], None]] = None,
     keep_files: Optional[set[str]] = None,
+    progress_callback: Optional[Callable[[float, float, float], None]] = None,
 ) -> str:
     """Safely cache remote/network dataset .npy file to fast local SSD storage."""
     log = log_fn or (lambda msg, **kw: print(f"[DatasetCache] {msg}"))
@@ -436,7 +437,8 @@ def cache_dataset_to_local(
         effective_keep.add(remote_file.name)
         purge_local_dataset_cache(cache_dir=cache_dir, keep_files=effective_keep, log_fn=log)
 
-        free_space = shutil.disk_usage(str(cache_dir)).free
+        # Check local disk space before attempting cache copy (require 1.15x buffer)
+        free_space = shutil.disk_usage(cache_dir).free
         free_gb = free_space / (1024 ** 3)
         if free_space < remote_size * 1.15:
             log(
@@ -452,14 +454,36 @@ def cache_dataset_to_local(
 
         log(f"[DatasetCache] Streaming network dataset {remote_file.name} ({remote_size_gb:.2f} GB) to local SSD ({local_file})...")
         t0 = time.time()
-        buf_size = 4 * 1024 * 1024
+        buf_size = 2 * 1024 * 1024
+        transferred = 0
+        last_log_time = time.time()
         try:
             with open(str(remote_file), "rb") as src, open(str(temp_file), "wb") as dst:
-                while True:
-                    chunk = src.read(buf_size)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
+                with memoryview(bytearray(buf_size)) as mv:
+                    while True:
+                        n = src.readinto(mv)
+                        if not n:
+                            break
+                        dst.write(mv[:n])
+                        transferred += n
+                        now = time.time()
+                        if now - last_log_time >= 4.0:
+                            pct = (transferred / max(remote_size, 1)) * 100.0
+                            elapsed_cur = max(now - t0, 0.001)
+                            speed_cur = (transferred / (1024 * 1024)) / elapsed_cur
+                            rem_bytes = max(remote_size - transferred, 0)
+                            eta_s = rem_bytes / max(speed_cur * 1024 * 1024, 1)
+                            log(
+                                f"[DatasetCache] Caching {remote_file.name}: "
+                                f"{transferred / (1024**3):.2f}/{remote_size_gb:.2f} GB ({pct:.1f}%) "
+                                f"@ {speed_cur:.1f} MB/s (ETA: {eta_s:.0f}s)"
+                            )
+                            if progress_callback:
+                                try:
+                                    progress_callback(pct, speed_cur, eta_s)
+                                except Exception:
+                                    pass
+                            last_log_time = now
         except OSError as os_err:
             log(f"[DatasetCache] Chunked stream encountered {os_err}, attempting fallback via shutil.copyfile...", level="WARNING")
             shutil.copyfile(str(remote_file), str(temp_file))
