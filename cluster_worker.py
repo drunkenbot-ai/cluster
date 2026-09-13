@@ -2205,7 +2205,7 @@ class StandaloneWorker:
                         self.log(f"Validation evaluation failed: {exc}", level="WARNING")
 
                 val_str = f", val loss: {val_loss:.4f}" if val_loss is not None else ""
-                self.log(f"Finished round {cur_round} (avg loss: {avg_loss:.4f}{val_str}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
+                self.log(f"Finished round {cur_round} in {elapsed:.1f}s (avg loss: {avg_loss:.4f}{val_str}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
 
                 # Save local weights
                 self._heartbeat(status="DEPOSITING", current_job_id=job_id)
@@ -2227,6 +2227,7 @@ class StandaloneWorker:
                         "steps_completed": sync_steps,
                         "avg_loss": round(avg_loss, 4),
                         "val_loss": round(val_loss, 4) if val_loss is not None else None,
+                        "compute_sec": round(elapsed, 2),
                         "tokens_processed": tokens_processed,
                         "tokens_per_sec": round(tokens_per_sec, 1),
                         "timestamp": time.time(),
@@ -2234,6 +2235,7 @@ class StandaloneWorker:
                 )
 
                 # Wait for coordinator to publish global model
+                t_sync_start = time.time()
                 self.log(f"Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
                 while not self.bus.is_global_weights_ready(job_id, cur_round):
                     if self.bus.is_stopped(job_id):
@@ -2241,10 +2243,17 @@ class StandaloneWorker:
                     self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
                     time.sleep(poll_interval)
 
+                sync_wait_sec = max(time.time() - t_sync_start, 0.0)
+                round_total_sec = elapsed + sync_wait_sec
+                duty_pct = (elapsed / max(round_total_sec, 0.001)) * 100.0
+
                 # Load synchronized global model weights into local model for next round
                 global_weights = self.bus.load_global_weights(job_id, cur_round, device=self.device_str)
                 model.load_state_dict(global_weights)
-                self.log(f"Successfully loaded averaged global weights for round {cur_round}.")
+                self.log(
+                    f"Successfully loaded averaged global weights for round {cur_round} in {sync_wait_sec:.1f}s. "
+                    f"⏱️ Timing: Compute {elapsed:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
+                )
 
                 cur_round += 1
 

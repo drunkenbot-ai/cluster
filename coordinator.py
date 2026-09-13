@@ -153,6 +153,7 @@ class ClusterCoordinator:
                 self.bus.mark_worker_dropped(self.job_id, wid, reason="timeout")
 
         # Load weights from all ready workers
+        t_agg_start = time.time()
         worker_states = []
         worker_telemetries: dict[str, dict[str, Any]] = {}
         for wid in ready_workers:
@@ -171,12 +172,18 @@ class ClusterCoordinator:
 
         # Atomically save to central storage
         self.bus.save_global_weights(self.job_id, round_num, global_state)
+        agg_sec = max(time.time() - t_agg_start, 0.0)
 
         # Aggregate telemetry across ready workers
         losses = [float(t["avg_loss"]) for t in worker_telemetries.values() if "avg_loss" in t]
         val_losses = [float(t["val_loss"]) for t in worker_telemetries.values() if t.get("val_loss") is not None]
         throughputs = [float(t.get("tokens_per_sec", 0.0)) for t in worker_telemetries.values()]
         tokens_list = [int(t.get("tokens_processed", 0)) for t in worker_telemetries.values()]
+        compute_times = [float(t["compute_sec"]) for t in worker_telemetries.values() if "compute_sec" in t]
+        avg_compute_sec = round(sum(compute_times) / len(compute_times), 1) if compute_times else None
+
+        compute_str = f", Avg Compute: {avg_compute_sec:.1f}s" if avg_compute_sec is not None else ""
+        print(f"[Coordinator] Round {round_num + 1} synchronized in {agg_sec:.1f}s (Aggregated {len(worker_states)} workers{compute_str}).")
 
         global_avg_loss = sum(losses) / len(losses) if losses else 0.0
         global_val_loss = round(sum(val_losses) / len(val_losses), 4) if val_losses else None
@@ -286,6 +293,9 @@ class ClusterCoordinator:
             "target_epochs": target_epochs,
             "ready_workers_count": len(ready_workers),
             "participating_workers": ready_workers,
+            "avg_compute_sec": avg_compute_sec,
+            "coordinator_agg_sec": round(agg_sec, 2),
+            "worker_compute_times": {wid: round(float(t["compute_sec"]), 2) for wid, t in worker_telemetries.items() if "compute_sec" in t},
             "worker_losses": {wid: round(float(t.get("avg_loss", 0.0)), 4) for wid, t in worker_telemetries.items()},
             "worker_val_losses": {wid: round(float(t["val_loss"]), 4) for wid, t in worker_telemetries.items() if t.get("val_loss") is not None},
         }

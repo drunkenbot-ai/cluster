@@ -1341,6 +1341,7 @@ class ClusterWorker:
                 # Train locally for K steps
                 self._current_status = "TRAINING"
                 self.log(f"Starting training round {current_round + 1}/{max_rounds} ({sync_interval_steps} local steps)...")
+                t_compute_start = time.time()
                 try:
                     avg_loss, dataloader_iter = self.run_training_round(
                         job_id=job_id,
@@ -1360,13 +1361,14 @@ class ClusterWorker:
                         except Exception as exc:
                             self.log(f"Validation evaluation failed in round {current_round + 1}: {exc}", level="WARNING")
 
+                    compute_sec = max(time.time() - t_compute_start, 1e-4)
                     round_metrics = getattr(self, "_last_round_metrics", {})
                     tokens_per_sec = round_metrics.get("tokens_per_sec", 0.0)
                     tokens_processed = round_metrics.get("tokens_processed", 0)
 
                     val_str = f", Val loss: {val_loss:.4f}" if val_loss is not None else ""
                     self.log(
-                        f"Round {current_round + 1}/{max_rounds} completed. "
+                        f"Round {current_round + 1}/{max_rounds} compute completed in {compute_sec:.1f}s. "
                         f"Avg loss: {avg_loss:.4f}{val_str}, Speed: {tokens_per_sec:,.0f} tok/s. Depositing weights & telemetry..."
                     )
                 except Exception as exc:
@@ -1395,6 +1397,7 @@ class ClusterWorker:
                         "steps_completed": sync_interval_steps,
                         "avg_loss": round(avg_loss, 4),
                         "val_loss": round(val_loss, 4) if val_loss is not None else None,
+                        "compute_sec": round(compute_sec, 2),
                         "tokens_processed": tokens_processed,
                         "tokens_per_sec": round(tokens_per_sec, 1),
                         "timestamp": time.time(),
@@ -1402,12 +1405,21 @@ class ClusterWorker:
                 )
 
                 self._current_status = "SYNC_WAIT"
+                t_sync_start = time.time()
 
                 # Wait for coordinator to publish global model for this round
                 while not self.bus.is_global_weights_ready(job_id, current_round):
                     if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                         return False
                     time.sleep(poll_interval)
+
+                sync_wait_sec = max(time.time() - t_sync_start, 0.0)
+                round_total_sec = compute_sec + sync_wait_sec
+                duty_pct = (compute_sec / max(round_total_sec, 0.001)) * 100.0
+                self.log(
+                    f"Round {current_round + 1}/{max_rounds} synchronized in {sync_wait_sec:.1f}s. "
+                    f"⏱️ Timing: Compute {compute_sec:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
+                )
 
                 current_round += 1
 
