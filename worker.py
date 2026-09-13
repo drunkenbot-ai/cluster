@@ -274,6 +274,7 @@ def calculate_optimal_worker_slots(
     model_cfg: dict[str, Any],
     training_cfg: dict[str, Any],
     device_str: str,
+    measured_vram_gb: Optional[float] = None,
 ) -> tuple[int, float, float]:
     """Calculate optimal number of worker processes to spawn on this node based on VRAM capacity.
 
@@ -281,6 +282,7 @@ def calculate_optimal_worker_slots(
         model_cfg: Model architecture parameters.
         training_cfg: Training parameters (batch size, precision).
         device_str: Device string (e.g. 'cuda:0', 'cpu').
+        measured_vram_gb: Optional empirically measured peak VRAM usage after running a training batch.
 
     Returns:
         (optimal_slots, estimated_job_gb, node_vram_gb)
@@ -299,6 +301,14 @@ def calculate_optimal_worker_slots(
         node_vram_gb = total_vram_bytes / (1024 ** 3)
     except Exception:
         return 1, 0.0, 0.0
+
+    if measured_vram_gb is not None and measured_vram_gb > 0:
+        estimated_job_gb = measured_vram_gb
+        # If a single worker already consumes more than 45% of total VRAM, multiple slots cannot fit
+        if (measured_vram_gb / max(node_vram_gb, 0.1)) > 0.45:
+            return 1, round(estimated_job_gb, 2), round(node_vram_gb, 2)
+        slots = max(1, min(4, int(node_vram_gb // (estimated_job_gb * 1.25))))
+        return slots, round(estimated_job_gb, 2), round(node_vram_gb, 2)
 
     explicit_gb = float(training_cfg.get("vram_required_gb") or model_cfg.get("vram_required_gb") or 0.0)
     if explicit_gb > 0:
@@ -735,15 +745,160 @@ class ClusterWorker:
                 pass
             self._stop_event.wait(self.heartbeat_interval)
 
+    def _cleanup_child_worker_procs(self) -> None:
+        """Clean up and terminate auxiliary child worker processes."""
+        if self._child_worker_procs:
+            self.log(f"Cleaning up {len(self._child_worker_procs)} auxiliary worker process(es)...")
+            for proc, aux_wid in list(self._child_worker_procs):
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=3.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    self.bus.purge_worker(aux_wid)
+                except Exception:
+                    pass
+            self._child_worker_procs.clear()
+
+    def _check_and_spawn_auxiliary_slots(
+        self,
+        job_id: str,
+        job: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Evaluate empirical VRAM utilization after the first batch and conditionally spawn auxiliary slots.
+
+        Spawning only happens if:
+        1. This is the primary persistent daemon (not an auxiliary child slot).
+        2. No auxiliary slots have already been spawned.
+        3. Multi-worker slots are not disabled by environment variable or config.
+        4. Device is CUDA and measured peak VRAM after batch 1 is < 45% of total capacity.
+        5. Free VRAM on the GPU is at least 1.25x the measured requirement.
+        """
+        if self.ephemeral_job_id is not None or self._child_worker_procs:
+            return
+
+        training_cfg = job.get("training_config", {}) if isinstance(job, dict) else {}
+
+        # Respect explicit disable switches
+        if os.environ.get("CLUSTER_DISABLE_AUTO_SLOTS", "").strip().lower() in ("1", "true", "yes"):
+            self.log("[Slots Evaluation] Multi-worker slots disabled by CLUSTER_DISABLE_AUTO_SLOTS.")
+            return
+
+        if not bool(training_cfg.get("allow_worker_slots", True)):
+            self.log("[Slots Evaluation] Multi-worker slots disabled by job training_config.")
+            return
+
+        if not self.device_str.startswith("cuda") or not torch.cuda.is_available():
+            return
+
+        dev_idx = 0
+        if ":" in self.device_str:
+            try:
+                dev_idx = int(self.device_str.split(":")[1])
+            except Exception:
+                dev_idx = 0
+
+        try:
+            torch.cuda.synchronize(dev_idx)
+            peak_reserved_bytes = torch.cuda.max_memory_reserved(dev_idx)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+        except Exception as exc:
+            self.log(f"[Slots Evaluation] Memory query failed: {exc}", level="WARNING")
+            return
+
+        used_gb = peak_reserved_bytes / (1024 ** 3)
+        total_gb = total_bytes / (1024 ** 3)
+        free_gb = free_bytes / (1024 ** 3)
+        util_pct = (peak_reserved_bytes / total_bytes) * 100.0 if total_bytes > 0 else 100.0
+
+        # Safety rule: A second worker process requires its own full PyTorch CUDA context,
+        # model weights, AdamW optimizer moments, gradients, and activation buffers.
+        # If the first batch already consumes >= 45% of total VRAM, or free VRAM is insufficient,
+        # spawning a second slot guarantees OOM or CUDA thrashing.
+        min_required_free_gb = used_gb * 1.25
+
+        if util_pct >= 45.0 or free_gb < min_required_free_gb:
+            self.log(
+                f"[Slots Evaluation] Batch 1 completed on {self.device_str}. Peak VRAM: {used_gb:.1f}/{total_gb:.1f} GB "
+                f"({util_pct:.0f}% utilized, {free_gb:.1f} GB free). "
+                f"Spawning slots suppressed (requires at least {min_required_free_gb:.1f} GB free & <45% utilization). "
+                f"Remaining in single-worker mode to prevent OOM."
+            )
+            return
+
+        max_configured = int(training_cfg.get("max_worker_slots", 4) or 4)
+        safe_slots = max(1, min(max_configured, int(total_gb // min_required_free_gb)))
+
+        if safe_slots <= 1:
+            self.log(
+                f"[Slots Evaluation] Batch 1 completed on {self.device_str}. Peak VRAM: {used_gb:.1f}/{total_gb:.1f} GB "
+                f"({util_pct:.0f}% utilized). Headroom supports 1 slot."
+            )
+            return
+
+        self.log(
+            f"[Slots Evaluation] Batch 1 completed on {self.device_str}. Peak VRAM: {used_gb:.1f}/{total_gb:.1f} GB "
+            f"({util_pct:.0f}% utilized, {free_gb:.1f} GB free). "
+            f"Node has excess capacity for {safe_slots} concurrent slots. "
+            f"Spawning {safe_slots - 1} auxiliary worker process(es)..."
+        )
+
+        for slot_idx in range(2, safe_slots + 1):
+            aux_worker_id = f"{self.worker_id}_slot{slot_idx}"
+            if sys.argv[0].endswith("cluster_worker.py"):
+                cmd = [
+                    sys.executable,
+                    sys.argv[0],
+                    "--shared-dir",
+                    str(self.bus.shared_dir),
+                    "--worker-id",
+                    aux_worker_id,
+                    "--device",
+                    self.device_str,
+                    "--ephemeral-job-id",
+                    job_id,
+                    "--allow-shared-device",
+                ]
+            else:
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "cluster.cli",
+                    "worker",
+                    "--shared-dir",
+                    str(self.bus.shared_dir),
+                    "--worker-id",
+                    aux_worker_id,
+                    "--device",
+                    self.device_str,
+                    "--ephemeral-job-id",
+                    job_id,
+                    "--allow-shared-device",
+                ]
+            try:
+                self.log(f"Launching auxiliary worker slot {slot_idx}: {aux_worker_id}...")
+                p = subprocess.Popen(
+                    cmd,
+                    stdout=None,
+                    stderr=None,
+                    stdin=subprocess.DEVNULL,
+                )
+                self._child_worker_procs.append((p, aux_worker_id))
+            except Exception as e:
+                self.log(f"Failed to spawn auxiliary worker slot {slot_idx}: {e}", level="WARNING")
+
+        if self._child_worker_procs:
+            time.sleep(1.5)
+
     def stop(self) -> None:
         """Signal worker to gracefully stop."""
         self._stop_event.set()
-        for proc, aux_wid in self._child_worker_procs:
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
-            except Exception:
-                pass
+        self._cleanup_child_worker_procs()
         if self._hb_thread.is_alive():
             self._hb_thread.join(timeout=2.0)
         try:
@@ -851,6 +1006,11 @@ class ClusterWorker:
             total_loss += loss_val
             steps_done += 1
 
+            # Evaluate empirical VRAM utilization after the first batch finishes
+            # and decide whether auxiliary slots can safely fit without OOM.
+            if step == 0 and round_num == 0:
+                self._check_and_spawn_auxiliary_slots(job_id=job_id, job=job)
+
             if log_callback:
                 log_callback({
                     "job_id": job_id,
@@ -957,62 +1117,9 @@ class ClusterWorker:
                     )
                 self._current_status = "PREPARING"
 
-                # 2. Dynamic multi-worker: spawn auxiliary workers if node has excess VRAM (primary daemon only)
-                if self.ephemeral_job_id is None and not self._child_worker_procs:
-                    optimal_slots, est_gb, node_gb = calculate_optimal_worker_slots(
-                        model_config, training_config, self.device_str
-                    )
-                    if optimal_slots > 1:
-                        self.log(
-                            f"Dynamic multi-worker: Node VRAM ({node_gb:.1f} GB) supports {optimal_slots} concurrent slots "
-                            f"(Job estimate: {est_gb:.1f} GB/slot). Spawning {optimal_slots - 1} auxiliary worker process(es)..."
-                        )
-                        for slot_idx in range(2, optimal_slots + 1):
-                            aux_worker_id = f"{self.worker_id}_slot{slot_idx}"
-                            if sys.argv[0].endswith("cluster_worker.py"):
-                                cmd = [
-                                    sys.executable,
-                                    sys.argv[0],
-                                    "--shared-dir",
-                                    str(self.bus.shared_dir),
-                                    "--worker-id",
-                                    aux_worker_id,
-                                    "--device",
-                                    self.device_str,
-                                    "--ephemeral-job-id",
-                                    job_id,
-                                    "--allow-shared-device",
-                                ]
-                            else:
-                                cmd = [
-                                    sys.executable,
-                                    "-m",
-                                    "cluster.cli",
-                                    "worker",
-                                    "--shared-dir",
-                                    str(self.bus.shared_dir),
-                                    "--worker-id",
-                                    aux_worker_id,
-                                    "--device",
-                                    self.device_str,
-                                    "--ephemeral-job-id",
-                                    job_id,
-                                    "--allow-shared-device",
-                                ]
-                            try:
-                                self.log(f"Launching auxiliary worker slot {slot_idx}: {aux_worker_id}...")
-                                p = subprocess.Popen(
-                                    cmd,
-                                    stdout=None,
-                                    stderr=None,
-                                    stdin=subprocess.DEVNULL,
-                                )
-                                self._child_worker_procs.append((p, aux_worker_id))
-                            except Exception as e:
-                                self.log(f"Failed to spawn auxiliary worker slot {slot_idx}: {e}", level="WARNING")
-
-                        if self._child_worker_procs:
-                            time.sleep(1.5)
+                # Clean up any stale auxiliary child processes from previous runs (primary daemon only)
+                if self.ephemeral_job_id is None:
+                    self._cleanup_child_worker_procs()
 
                 # 3. Claim data shard slot
                 shard_idx, total_shards = self.bus.claim_job_slot(job_id, self.worker_id)
@@ -1292,23 +1399,8 @@ class ClusterWorker:
             raise
         finally:
             # Terminate and reap auxiliary worker subprocesses (primary worker only)
-            if self._child_worker_procs:
-                self.log(f"Cleaning up {len(self._child_worker_procs)} auxiliary worker process(es)...")
-                for proc, aux_wid in self._child_worker_procs:
-                    try:
-                        if proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=3.0)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        self.bus.heartbeat(aux_wid, status="OFFLINE", current_job_id=None)
-                    except Exception:
-                        pass
-                self._child_worker_procs.clear()
+            if self.ephemeral_job_id is None:
+                self._cleanup_child_worker_procs()
 
             try:
                 if model is not None:
