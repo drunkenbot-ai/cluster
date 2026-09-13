@@ -32,6 +32,17 @@ from torch.utils.data import DataLoader
 from .bus import ClusterStorageBus
 from .sharding import ShardedTokenDataset
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def is_network_path(path_str: str) -> bool:
     """Determine if a file path resides on a remote network share (SMB/NFS/UNC)."""
@@ -674,7 +685,17 @@ class ClusterWorker:
     def log(self, message: str, level: str = "INFO") -> None:
         """Write diagnostic log to stdout and central SQLite worker_logs table."""
         timestamp_str = time.strftime("%H:%M:%S")
-        print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {message}", flush=True)
+        try:
+            print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {message}", flush=True)
+        except UnicodeEncodeError:
+            try:
+                enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                safe_msg = message.encode(enc, errors="replace").decode(enc)
+                print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {safe_msg}", flush=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
         try:
             self.bus.write_worker_log(self.worker_id, message, level=level)
         except Exception:
@@ -1418,7 +1439,7 @@ class ClusterWorker:
                 duty_pct = (compute_sec / max(round_total_sec, 0.001)) * 100.0
                 self.log(
                     f"Round {current_round + 1}/{max_rounds} synchronized in {sync_wait_sec:.1f}s. "
-                    f"⏱️ Timing: Compute {compute_sec:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
+                    f"[Timing] Compute {compute_sec:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
                 )
 
                 current_round += 1

@@ -34,6 +34,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Generator, Optional
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # =============================================================================
 # 1. Hardware Detection & Dependency Auto-Bootstrapping
@@ -1690,6 +1701,13 @@ class StandaloneWorker:
         timestamp_str = time.strftime("%H:%M:%S")
         try:
             print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {message}", flush=True)
+        except UnicodeEncodeError:
+            try:
+                enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                safe_msg = message.encode(enc, errors="replace").decode(enc)
+                print(f"[{timestamp_str}] [{level}] [Worker {self.worker_id}] {safe_msg}", flush=True)
+            except Exception:
+                pass
         except Exception:
             pass
         try:
@@ -2252,7 +2270,7 @@ class StandaloneWorker:
                 model.load_state_dict(global_weights)
                 self.log(
                     f"Successfully loaded averaged global weights for round {cur_round} in {sync_wait_sec:.1f}s. "
-                    f"⏱️ Timing: Compute {elapsed:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
+                    f"[Timing] Compute {elapsed:.1f}s | Sync Wait {sync_wait_sec:.1f}s | Duty Cycle {duty_pct:.1f}%"
                 )
 
                 cur_round += 1
