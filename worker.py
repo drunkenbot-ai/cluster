@@ -637,6 +637,145 @@ class ClusterWorker:
                 except Exception:
                     pass
 
+    def run_hardware_preflight(self) -> tuple[bool, list[str]]:
+        """Execute comprehensive hardware, storage, and runtime preflight validation.
+
+        Returns:
+            (all_passed: bool, report_lines: list[str])
+        """
+        report: list[str] = []
+        is_healthy = True
+
+        report.append("=" * 72)
+        report.append(f"[PREFLIGHT] Node Preflight Hardware Verification (Worker: {self.worker_id})")
+        report.append("-" * 72)
+
+        # 1. Device & Compute Capability
+        is_cuda = self.device_str.startswith("cuda") and torch.cuda.is_available()
+        if is_cuda:
+            try:
+                device_idx = 0
+                if ":" in self.device_str:
+                    try:
+                        device_idx = int(self.device_str.split(":")[1])
+                    except ValueError:
+                        device_idx = 0
+                props = torch.cuda.get_device_properties(device_idx)
+                arch_tag = f"sm_{props.major}{props.minor}"
+                arch_list = torch.cuda.get_arch_list() if hasattr(torch.cuda, "get_arch_list") else []
+                arch_status = "Native SASS verified" if arch_tag in arch_list else "Forward-compatible / PTX"
+                report.append(f"[PASS] Compute Device   : {self.device_str} ({props.name}, {self.vram_gb} GB VRAM, {arch_tag})")
+                report.append(f"[PASS] PyTorch / CUDA   : {torch.__version__} (Arch: {arch_status})")
+            except Exception as exc:
+                report.append(f"[WARN] Compute Device   : {self.device_str} ({exc})")
+        else:
+            report.append(f"[PASS] Compute Device   : {self.device_str} ({self.gpu_name})")
+
+        # 2. Kernel Execution Check
+        try:
+            test_a = torch.ones((4, 4), device=self.device_str)
+            test_b = (test_a * 2.5 + 1.0).sum().item()
+            del test_a
+            if abs(test_b - 56.0) > 1e-4:
+                raise RuntimeError(f"Unexpected tensor math result: {test_b} != 56.0")
+            report.append(f"[PASS] Kernel Execution : Tensor arithmetic validated on {self.device_str}")
+        except Exception as exc:
+            is_healthy = False
+            report.append(f"[FAIL] Kernel Execution : {exc}")
+            if "no kernel image" in str(exc).lower():
+                report.append(f"       Action Required  : PyTorch lacks GPU architecture binary. Install compatible PyTorch (e.g. cu128 nightly).")
+
+        # 3. Mixed Precision (AMP FP16 & BF16) Check
+        if is_cuda:
+            fp16_ok = False
+            bf16_ok = False
+            try:
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    m1 = torch.randn((8, 8), device=self.device_str)
+                    m2 = m1 @ m1
+                del m1, m2
+                fp16_ok = True
+            except Exception as exc:
+                report.append(f"[WARN] AMP FP16 Failed  : {exc}")
+
+            bf16_hw = torch.cuda.is_bf16_supported()
+            if bf16_hw:
+                try:
+                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                        m1 = torch.randn((8, 8), device=self.device_str)
+                        m2 = m1 @ m1
+                    del m1, m2
+                    bf16_ok = True
+                except Exception as exc:
+                    report.append(f"[WARN] AMP BF16 Failed  : {exc}")
+
+            bf16_str = "BF16 (Native)" if bf16_ok else ("BF16 (Emulated)" if not bf16_hw else "BF16 (Unavailable)")
+            report.append(f"[PASS] Mixed Precision  : FP16 ({'OK' if fp16_ok else 'FAIL'}), {bf16_str}")
+
+        # 4. Memory Scratch Buffer Allocation & Free
+        if is_cuda:
+            try:
+                scratch = torch.empty((16, 1024, 1024), dtype=torch.float32, device=self.device_str)
+                del scratch
+                torch.cuda.empty_cache()
+                report.append(f"[PASS] Memory Allocation: 64.0 MB scratch buffer allocated & reclaimed")
+            except Exception as exc:
+                is_healthy = False
+                report.append(f"[FAIL] Memory Allocation: Failed to allocate scratch buffer: {exc}")
+
+        # 5. Shared Storage (NFS/SMB) Read & Write Latency
+        try:
+            shared_dir = self.bus.shared_dir
+            if not shared_dir.exists():
+                raise FileNotFoundError(f"Shared storage path does not exist: {shared_dir}")
+            test_path = shared_dir / f".preflight_{self.worker_id}_{int(time.time())}.tmp"
+            t0 = time.time()
+            test_path.write_text(f"preflight_{self.worker_id}", encoding="utf-8")
+            read_back = test_path.read_text(encoding="utf-8")
+            latency_ms = round((time.time() - t0) * 1000, 1)
+            test_path.unlink(missing_ok=True)
+            if read_back != f"preflight_{self.worker_id}":
+                raise IOError("Shared storage read back content mismatch")
+            report.append(f"[PASS] Shared Storage   : Read/Write verified (latency: {latency_ms}ms) on {shared_dir}")
+        except Exception as exc:
+            is_healthy = False
+            report.append(f"[FAIL] Shared Storage   : {exc}")
+
+        # 6. Micro-Transformer Mini-Step (Forward + Backward + AdamW)
+        try:
+            class _PreflightMiniLM(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.emb = nn.Embedding(256, 64)
+                    self.fc = nn.Linear(64, 256)
+                def forward(self, x):
+                    return self.fc(self.emb(x))
+
+            mini = _PreflightMiniLM().to(self.device_str)
+            opt = torch.optim.AdamW(mini.parameters(), lr=1e-3)
+            inp = torch.randint(0, 256, (2, 8), device=self.device_str)
+            target = torch.randint(0, 256, (2, 8), device=self.device_str)
+            out = mini(inp)
+            loss = F.cross_entropy(out.view(-1, 256), target.view(-1))
+            loss.backward()
+            opt.step()
+            del mini, opt, inp, target, out, loss
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            report.append(f"[PASS] Transformer Step : Mini-model forward + backward + AdamW verified")
+        except Exception as exc:
+            is_healthy = False
+            report.append(f"[FAIL] Transformer Step : Mini-model execution failed: {exc}")
+
+        report.append("=" * 72)
+        if is_healthy:
+            report.append("[PREFLIGHT] System Status: HEALTHY. Node ready to accept cluster jobs.")
+        else:
+            report.append("[PREFLIGHT] System Status: UNHEALTHY (DEGRADED). Refusing to claim jobs.")
+        report.append("=" * 72)
+
+        return is_healthy, report
+
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""
         from .cluster_worker import acquire_singleton_lock, release_singleton_lock, get_device_tag
@@ -653,6 +792,22 @@ class ClusterWorker:
                 self.log(f"A worker is already running for worker ID '{self.worker_id}' on this machine. Exiting.", level="WARNING")
                 return
             self._lock_acquired = True
+
+        # Run hardware and environment preflight verification
+        preflight_ok, report_lines = self.run_hardware_preflight()
+        for line in report_lines:
+            self.log(line)
+
+        if not preflight_ok:
+            self._current_status = "DEGRADED"
+            self.log("Worker failed hardware preflight checks. Halting job acquisition until issues are resolved.", level="ERROR")
+            try:
+                self.bus.heartbeat(self.worker_id, status="DEGRADED", current_job_id=None)
+            except Exception:
+                pass
+            while not self._stop_event.is_set():
+                self._stop_event.wait(poll_interval)
+            return
 
         self.log(f"Worker daemon started. Listening for jobs on shared drive...")
         try:
