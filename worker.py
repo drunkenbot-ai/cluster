@@ -367,6 +367,69 @@ def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str
     return device_str, gpu_name, vram_gb
 
 
+def collect_system_metrics(device_str: str = "cpu", total_vram_gb: float = 0.0) -> dict[str, Any]:
+    """Collect current real-time CPU, RAM, and GPU VRAM usage."""
+    metrics: dict[str, Any] = {
+        "cpu_percent": 0.0,
+        "ram_used_gb": 0.0,
+        "ram_total_gb": 0.0,
+        "vram_used_gb": 0.0,
+        "vram_total_gb": float(total_vram_gb or 0.0),
+    }
+
+    # 1. RAM & CPU
+    try:
+        import psutil
+        metrics["cpu_percent"] = round(float(psutil.cpu_percent(interval=None)), 1)
+        vm = psutil.virtual_memory()
+        metrics["ram_used_gb"] = round(float(vm.used) / (1024 ** 3), 1)
+        metrics["ram_total_gb"] = round(float(vm.total) / (1024 ** 3), 1)
+    except Exception:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+                tot = float(stat.ullTotalPhys) / (1024 ** 3)
+                avail = float(stat.ullAvailPhys) / (1024 ** 3)
+                metrics["ram_total_gb"] = round(tot, 1)
+                metrics["ram_used_gb"] = round(tot - avail, 1)
+                metrics["cpu_percent"] = float(stat.dwMemoryLoad)
+            except Exception:
+                pass
+
+    # 2. VRAM
+    try:
+        if device_str.startswith("cuda") and torch.cuda.is_available():
+            dev_idx = 0
+            if ":" in device_str:
+                try:
+                    dev_idx = int(device_str.split(":")[1])
+                except ValueError:
+                    dev_idx = 0
+            free_bytes, total_bytes = torch.cuda.mem_get_info(dev_idx)
+            used_bytes = max(total_bytes - free_bytes, 0)
+            metrics["vram_used_gb"] = round(float(used_bytes) / (1024 ** 3), 2)
+            metrics["vram_total_gb"] = round(float(total_bytes) / (1024 ** 3), 2)
+    except Exception:
+        pass
+
+    return metrics
+
+
 def build_model_from_config(
     model_config: dict[str, Any],
     device: str,
@@ -554,10 +617,12 @@ class ClusterWorker:
                     )
                     os._exit(0)
 
+                metrics = collect_system_metrics(self.device_str, getattr(self, "vram_gb", 0.0))
                 self.bus.heartbeat(
                     worker_id=self.worker_id,
                     status=self._current_status,
                     current_job_id=self._current_job_id,
+                    metrics=metrics,
                 )
             except Exception:
                 pass
