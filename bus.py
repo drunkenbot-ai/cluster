@@ -579,6 +579,12 @@ class ClusterStorageBus:
     def claim_job_slot(self, job_id: str, worker_id: str) -> tuple[int, int]:
         """Claim a shard index for a job. Returns (shard_index, total_shards)."""
         def _op(conn: sqlite3.Connection) -> tuple[int, int]:
+            # Guard: reject slot claiming if worker is degraded, incompatible, or offline
+            cursor = conn.execute("SELECT status FROM workers WHERE worker_id = ?;", (worker_id,))
+            w_row = cursor.fetchone()
+            if w_row and str(w_row["status"]).upper() in {"DEGRADED", "INCOMPATIBLE", "OFFLINE"}:
+                raise RuntimeError(f"Worker '{worker_id}' is in status '{w_row['status']}' and cannot claim a job slot.")
+
             # Check if worker already has a slot
             cursor = conn.execute(
                 "SELECT shard_index, total_shards FROM job_participants WHERE job_id = ? AND worker_id = ?;",
@@ -769,6 +775,9 @@ class ClusterStorageBus:
                 rows.append(d)
             return rows
         return self._run_with_retry(_op, default_on_error=[])
+
+    # Alias for convenience
+    get_round_history = get_all_round_history
 
     def get_latest_rounds_for_all_jobs(self) -> dict[str, dict[str, Any]]:
         """Fetch the latest recorded round history summary for each job in a single fast query."""

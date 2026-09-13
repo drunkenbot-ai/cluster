@@ -169,10 +169,12 @@ class ClusterCoordinator:
 
         # Aggregate telemetry across ready workers
         losses = [float(t["avg_loss"]) for t in worker_telemetries.values() if "avg_loss" in t]
+        val_losses = [float(t["val_loss"]) for t in worker_telemetries.values() if t.get("val_loss") is not None]
         throughputs = [float(t.get("tokens_per_sec", 0.0)) for t in worker_telemetries.values()]
         tokens_list = [int(t.get("tokens_processed", 0)) for t in worker_telemetries.values()]
 
         global_avg_loss = sum(losses) / len(losses) if losses else 0.0
+        global_val_loss = round(sum(val_losses) / len(val_losses), 4) if val_losses else None
         aggregate_tokens_sec = sum(throughputs)
         total_tokens_round = sum(tokens_list)
 
@@ -190,11 +192,13 @@ class ClusterCoordinator:
             "max_rounds": max_rounds,
             "effective_step": effective_step,
             "global_loss": round(global_avg_loss, 4),
+            "val_loss": global_val_loss,
             "aggregate_tokens_per_sec": round(aggregate_tokens_sec, 1),
             "total_tokens_round": total_tokens_round,
             "ready_workers_count": len(ready_workers),
             "participating_workers": ready_workers,
             "worker_losses": {wid: round(float(t.get("avg_loss", 0.0)), 4) for wid, t in worker_telemetries.items()},
+            "worker_val_losses": {wid: round(float(t["val_loss"]), 4) for wid, t in worker_telemetries.items() if t.get("val_loss") is not None},
         }
 
         # Persist round summary to SQLite database
@@ -215,6 +219,9 @@ class ClusterCoordinator:
             progress_callback(summary_metrics)
 
         return global_state
+
+    # Alias for convenience
+    wait_for_round_and_aggregate = wait_and_average_round
 
     def run_job(
         self,

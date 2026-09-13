@@ -1221,7 +1221,16 @@ class StandaloneWorker:
                     status = active_job.get("status")
                     jid = active_job.get("job_id", "")
                     if status == "RUNNING" and not self.bus.is_stopped(jid):
-                        self._execute_job(active_job, poll_interval=poll_interval)
+                        is_compat, reason = self.is_job_compatible(active_job)
+                        if not is_compat:
+                            if not hasattr(self, "_incompat_reported"):
+                                self._incompat_reported = set()
+                            if jid not in self._incompat_reported:
+                                self._incompat_reported.add(jid)
+                                self.log(f"Worker {self.worker_id} cannot accept job '{jid}': {reason}. Skipping.", level="WARNING")
+                                self._heartbeat(status="INCOMPATIBLE", current_job_id=None)
+                        else:
+                            self._execute_job(active_job, poll_interval=poll_interval)
                     elif status == "QUEUED":
                         self._heartbeat(status="READY", current_job_id=jid)
             except Exception as exc:
@@ -1229,8 +1238,56 @@ class StandaloneWorker:
 
             time.sleep(poll_interval)
 
+    def is_job_compatible(self, job: dict[str, Any]) -> tuple[bool, str]:
+        """Check if this worker node and device are compatible with the requested job."""
+        if getattr(self, "_current_status", "") == "DEGRADED":
+            return False, "Worker is in DEGRADED status due to failed hardware preflight checks."
+
+        target_workers = job.get("target_workers")
+        if target_workers and isinstance(target_workers, list):
+            if self.worker_id not in target_workers:
+                return False, f"Worker ID '{self.worker_id}' is not in job target_workers list: {target_workers}."
+
+        if self.device_str.startswith("cuda"):
+            import torch
+            if not torch.cuda.is_available():
+                return False, "Job targets CUDA, but CUDA is not available on this host."
+            try:
+                dev = torch.device(self.device_str)
+                test_t = torch.ones(2, 2, device=dev)
+                _ = (test_t + 1.0).sum().item()
+                del test_t
+            except Exception as exc:
+                return False, f"CUDA device '{self.device_str}' failed kernel execution test: {exc}"
+
+        tcfg = job.get("training_config", {})
+        if isinstance(tcfg, str):
+            try:
+                tcfg = json.loads(tcfg)
+            except Exception:
+                tcfg = {}
+        prec = str(tcfg.get("precision", "float32")).lower()
+        if prec in {"bfloat16", "bf16"} and self.device_str.startswith("cuda"):
+            import torch
+            if not (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()):
+                return False, f"Device '{self.device_str}' does not natively support bfloat16 precision."
+
+        dataset_path = job.get("dataset_path", "")
+        if not dataset_path:
+            return False, "Job specifies no dataset_path."
+        if not os.path.exists(dataset_path):
+            return False, f"Dataset path is not accessible on this node: '{dataset_path}'"
+
+        return True, "Compatible"
+
     def _execute_job(self, job: dict[str, Any], poll_interval: float = 2.0) -> None:
         job_id = job["job_id"]
+        is_compat, reason = self.is_job_compatible(job)
+        if not is_compat:
+            self.log(f"Worker {self.worker_id} cannot execute job '{job_id}': {reason}. Refusing claim.", level="WARNING")
+            self._heartbeat(status="INCOMPATIBLE", current_job_id=None)
+            return
+
         self.log(f">>> Claimed job: {job_id}")
         self._heartbeat(status="PREPARING", current_job_id=job_id)
 
@@ -1238,8 +1295,10 @@ class StandaloneWorker:
         optimizer = None
         dataloader = None
         dataloader_iter = None
+        val_loader = None
         dataset = None
         token_array = None
+        val_token_array = None
         global_weights = None
         batch = None
         x = None
@@ -1332,6 +1391,27 @@ class StandaloneWorker:
             dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
             dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
             dataloader_iter = iter(dataloader)
+
+            # Prepare validation dataset if available
+            val_dataset_path = job.get("val_dataset_path")
+            if not val_dataset_path or not os.path.exists(val_dataset_path):
+                cand_val = Path(dataset_path).parent / "val_tokens.npy"
+                if cand_val.exists():
+                    val_dataset_path = str(cand_val)
+                else:
+                    cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
+                    if cand_shared_val.exists():
+                        val_dataset_path = str(cand_shared_val)
+
+            if val_dataset_path and os.path.exists(val_dataset_path):
+                try:
+                    val_token_array = np.load(val_dataset_path, mmap_mode="r")
+                    if len(val_token_array) > context_length:
+                        val_ds = StandaloneTokenDataset(val_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
+                        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+                        self.log(f"Validation dataset mapped ({len(val_token_array):,} tokens).")
+                except Exception as e:
+                    self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
 
             model = build_worker_model(model_cfg, self.device_str)
             optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
@@ -1468,7 +1548,31 @@ class StandaloneWorker:
                 elapsed = max(time.time() - start_time, 1e-4)
                 tokens_per_sec = tokens_processed / elapsed
                 avg_loss = sum(step_losses) / max(len(step_losses), 1)
-                self.log(f"Finished round {cur_round} (avg loss: {avg_loss:.4f}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
+
+                val_loss = None
+                if val_loader is not None:
+                    try:
+                        model.eval()
+                        v_loss_sum = 0.0
+                        v_batches = 0
+                        with torch.no_grad():
+                            for v_step, (vx, vy) in enumerate(val_loader):
+                                if v_step >= 25:
+                                    break
+                                vx = vx.to(self.device_str, non_blocking=True)
+                                vy = vy.to(self.device_str, non_blocking=True)
+                                v_out = model(vx)
+                                v_logits = v_out[0] if isinstance(v_out, (tuple, list)) else (v_out.logits if hasattr(v_out, "logits") else v_out)
+                                v_loss = F.cross_entropy(v_logits.view(-1, v_logits.size(-1)), vy.view(-1), ignore_index=-100)
+                                v_loss_sum += float(v_loss.item())
+                                v_batches += 1
+                        val_loss = v_loss_sum / max(v_batches, 1)
+                        model.train()
+                    except Exception as exc:
+                        self.log(f"Validation evaluation failed: {exc}", level="WARNING")
+
+                val_str = f", val loss: {val_loss:.4f}" if val_loss is not None else ""
+                self.log(f"Finished round {cur_round} (avg loss: {avg_loss:.4f}{val_str}, speed: {tokens_per_sec:.0f} tok/s). Depositing weights & telemetry...")
 
                 # Save local weights
                 self._heartbeat(status="DEPOSITING", current_job_id=job_id)
@@ -1489,6 +1593,7 @@ class StandaloneWorker:
                         "round": cur_round,
                         "steps_completed": sync_steps,
                         "avg_loss": round(avg_loss, 4),
+                        "val_loss": round(val_loss, 4) if val_loss is not None else None,
                         "tokens_processed": tokens_processed,
                         "tokens_per_sec": round(tokens_per_sec, 1),
                         "timestamp": time.time(),

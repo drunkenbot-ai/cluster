@@ -163,6 +163,8 @@ class ClusterWorker:
         self._current_job_id: Optional[str] = None
         self._current_status = "IDLE"
         self._last_round_metrics: dict[str, Any] = {}
+        self._preflight_ok: bool = True
+        self._incompatible_jobs_reported: set[str] = set()
 
         # Hardware preflight check
         if self.device_str.startswith("cuda") and torch.cuda.is_available():
@@ -402,6 +404,11 @@ class ClusterWorker:
             True if completed successfully, False if aborted or stopped.
         """
         job_id = job["job_id"]
+        is_compat, reason = self.is_job_compatible(job)
+        if not is_compat:
+            self.log(f"Worker {self.worker_id} cannot execute job '{job_id}': {reason}. Refusing claim.", level="WARNING")
+            return False
+
         self._current_job_id = job_id
         self._current_status = "PREPARING"
         self.log(f">>> Claimed job: {job_id}")
@@ -419,8 +426,10 @@ class ClusterWorker:
         optimizer = None
         dataloader = None
         dataloader_iter = None
+        val_loader = None
         dataset = None
         token_array = None
+        val_token_array = None
 
         try:
             try:
@@ -491,6 +500,33 @@ class ClusterWorker:
                 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
                 dataloader_iter = iter(dataloader)
 
+                # Prepare validation dataset if available alongside train tokens
+                val_dataset_path = job.get("val_dataset_path")
+                if not val_dataset_path or not os.path.exists(val_dataset_path):
+                    cand_val = Path(dataset_path).parent / "val_tokens.npy"
+                    if cand_val.exists():
+                        val_dataset_path = str(cand_val)
+                    else:
+                        cand_shared_val = self.bus.shared_dir / "val_tokens.npy"
+                        if cand_shared_val.exists():
+                            val_dataset_path = str(cand_shared_val)
+
+                if val_dataset_path and os.path.exists(val_dataset_path):
+                    try:
+                        val_token_array = np.load(val_dataset_path, mmap_mode="r")
+                        if len(val_token_array) > context_length:
+                            val_dataset = ShardedTokenDataset(
+                                token_array=val_token_array,
+                                context_length=context_length,
+                                shard_index=shard_idx,
+                                total_shards=total_shards,
+                                vocab_size=vocab_size,
+                            )
+                            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                            self.log(f"Validation dataset mapped ({len(val_token_array):,} tokens, {len(val_dataset):,} samples).")
+                    except Exception as e:
+                        self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
+
                 # Build model and optimizer
                 self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str, logger=self.log)
@@ -530,6 +566,18 @@ class ClusterWorker:
                         )
                         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
                         dataloader_iter = iter(dataloader)
+                        if val_token_array is not None and len(val_token_array) > context_length:
+                            try:
+                                val_dataset = ShardedTokenDataset(
+                                    token_array=val_token_array,
+                                    context_length=context_length,
+                                    shard_index=shard_idx,
+                                    total_shards=total_shards,
+                                    vocab_size=vocab_size,
+                                )
+                                val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -561,13 +609,21 @@ class ClusterWorker:
                         job=job,
                         log_callback=log_callback,
                     )
+                    val_loss = None
+                    if val_loader is not None:
+                        try:
+                            val_loss = self.evaluate_validation(model, val_loader, max_batches=25)
+                        except Exception as exc:
+                            self.log(f"Validation evaluation failed in round {current_round + 1}: {exc}", level="WARNING")
+
                     round_metrics = getattr(self, "_last_round_metrics", {})
                     tokens_per_sec = round_metrics.get("tokens_per_sec", 0.0)
                     tokens_processed = round_metrics.get("tokens_processed", 0)
 
+                    val_str = f", Val loss: {val_loss:.4f}" if val_loss is not None else ""
                     self.log(
                         f"Round {current_round + 1}/{max_rounds} completed. "
-                        f"Avg loss: {avg_loss:.4f}, Speed: {tokens_per_sec:,.0f} tok/s. Depositing weights & telemetry..."
+                        f"Avg loss: {avg_loss:.4f}{val_str}, Speed: {tokens_per_sec:,.0f} tok/s. Depositing weights & telemetry..."
                     )
                 except Exception as exc:
                     import traceback
@@ -594,6 +650,7 @@ class ClusterWorker:
                         "round": current_round,
                         "steps_completed": sync_interval_steps,
                         "avg_loss": round(avg_loss, 4),
+                        "val_loss": round(val_loss, 4) if val_loss is not None else None,
                         "tokens_processed": tokens_processed,
                         "tokens_per_sec": round(tokens_per_sec, 1),
                         "timestamp": time.time(),
@@ -774,7 +831,140 @@ class ClusterWorker:
             report.append("[PREFLIGHT] System Status: UNHEALTHY (DEGRADED). Refusing to claim jobs.")
         report.append("=" * 72)
 
+        self._preflight_ok = is_healthy
         return is_healthy, report
+
+    def evaluate_validation(
+        self,
+        model: nn.Module,
+        val_loader: DataLoader,
+        max_batches: int = 25,
+    ) -> float:
+        """Evaluate validation loss on validation data loader using cross entropy.
+
+        Args:
+            model: Current PyTorch model.
+            val_loader: DataLoader yielding (input_ids, target_ids).
+            max_batches: Maximum number of batches to evaluate.
+
+        Returns:
+            Average validation loss float.
+        """
+        model.eval()
+        total_loss = 0.0
+        batches = 0
+        device = torch.device(self.device_str)
+
+        with torch.no_grad():
+            for step, batch in enumerate(val_loader):
+                if step >= max_batches:
+                    break
+                if isinstance(batch, (tuple, list)):
+                    inputs, targets = batch[0], batch[1]
+                elif isinstance(batch, dict):
+                    inputs = batch.get("input_ids") or batch.get("inputs")
+                    targets = batch.get("target_ids") or batch.get("targets") or batch.get("labels")
+                else:
+                    continue
+
+                if inputs is None or targets is None:
+                    continue
+
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                out = model(inputs)
+                logits = out[0] if isinstance(out, (tuple, list)) else (out.logits if hasattr(out, "logits") else out)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+                total_loss += float(loss.item())
+                batches += 1
+
+        model.train()
+        return (total_loss / batches) if batches > 0 else 0.0
+
+    def is_job_compatible(self, job: dict[str, Any]) -> tuple[bool, str]:
+        """Check if this worker node and device are compatible with the requested job.
+
+        Returns:
+            (True, "Compatible") or (False, "<detailed reason>")
+        """
+        # 1. Check worker health / preflight status
+        if getattr(self, "_current_status", "") == "DEGRADED" or not getattr(self, "_preflight_ok", True):
+            return False, "Worker is in DEGRADED status due to failed hardware preflight checks."
+
+        # 2. Check target worker filtering if specified by job
+        target_workers = job.get("target_workers")
+        if target_workers and isinstance(target_workers, list):
+            if self.worker_id not in target_workers:
+                return False, f"Worker ID '{self.worker_id}' is not in job target_workers list: {target_workers}."
+
+        # 3. Check compute device & PyTorch CUDA kernel execution
+        if self.device_str.startswith("cuda"):
+            if not torch.cuda.is_available():
+                return False, "Job targets CUDA, but CUDA is not available on this host."
+            try:
+                # Fast kernel test to catch architecture binary incompatibility (e.g. sm_120 on outdated torch)
+                dev = torch.device(self.device_str)
+                test_t = torch.ones(2, 2, device=dev)
+                _ = (test_t + 1.0).sum().item()
+                del test_t
+            except Exception as exc:
+                return False, f"CUDA device '{self.device_str}' failed kernel execution test: {exc}"
+
+        # 4. Check precision compatibility (e.g. bfloat16 hardware support)
+        tcfg = job.get("training_config", {})
+        if isinstance(tcfg, str):
+            try:
+                tcfg = json.loads(tcfg)
+            except Exception:
+                tcfg = {}
+        prec = str(tcfg.get("precision", "float32")).lower()
+        if prec in {"bfloat16", "bf16"}:
+            if self.device_str.startswith("cuda"):
+                if not (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()):
+                    return False, f"Device '{self.device_str}' does not natively support bfloat16 precision."
+
+        # 5. Check dataset accessibility
+        dataset_path = job.get("dataset_path", "")
+        if not dataset_path:
+            return False, "Job specifies no dataset_path."
+        if not os.path.exists(dataset_path):
+            return False, f"Dataset path is not accessible on this node: '{dataset_path}'"
+
+        # 6. Check VRAM capacity against model parameters (if on CUDA)
+        if self.device_str.startswith("cuda") and torch.cuda.is_available():
+            try:
+                model_cfg = job.get("model_config", {})
+                if isinstance(model_cfg, str):
+                    try:
+                        model_cfg = json.loads(model_cfg)
+                    except Exception:
+                        model_cfg = {}
+                vocab_size = int(model_cfg.get("vocab_size") or 32000)
+                emb_size = int(model_cfg.get("embedding_size") or 768)
+                n_layers = int(model_cfg.get("layer_count") or 12)
+                ctx_len = int(model_cfg.get("context_length") or 1024)
+                batch_size = int(tcfg.get("batch_size") or 2)
+
+                approx_params = (vocab_size * emb_size * 2) + (n_layers * 12 * emb_size * emb_size)
+                approx_bytes = approx_params * 16 + (batch_size * ctx_len * emb_size * n_layers * 4)
+                approx_gb = approx_bytes / (1024 ** 3)
+
+                dev_idx = 0
+                if ":" in self.device_str:
+                    try:
+                        dev_idx = int(self.device_str.split(":")[1])
+                    except ValueError:
+                        dev_idx = 0
+                free_b, total_b = torch.cuda.mem_get_info(dev_idx)
+                total_gb = total_b / (1024 ** 3)
+
+                if approx_gb > total_gb * 0.95:
+                    return False, f"Estimated model memory ({approx_gb:.1f} GB) exceeds total GPU VRAM ({total_gb:.1f} GB)."
+            except Exception:
+                pass
+
+        return True, "Compatible"
 
     def run_daemon(self, poll_interval: float = 3.0) -> None:
         """Run persistent background loop polling for jobs and executing them."""
@@ -818,7 +1008,18 @@ class ClusterWorker:
                 try:
                     active_job = self.bus.get_active_job()
                     if active_job and active_job.get("status") in {"RUNNING", "QUEUED"}:
-                        self.execute_job(active_job, poll_interval=poll_interval)
+                        job_id = active_job.get("job_id", "")
+                        is_compat, reason = self.is_job_compatible(active_job)
+                        if not is_compat:
+                            if job_id not in self._incompatible_jobs_reported:
+                                self._incompatible_jobs_reported.add(job_id)
+                                self.log(f"Worker {self.worker_id} cannot accept job '{job_id}': {reason}. Skipping.", level="WARNING")
+                                try:
+                                    self.bus.heartbeat(self.worker_id, status="INCOMPATIBLE", current_job_id=None)
+                                except Exception:
+                                    pass
+                        else:
+                            self.execute_job(active_job, poll_interval=poll_interval)
                 except Exception as exc:
                     import traceback
                     tb = traceback.format_exc()
