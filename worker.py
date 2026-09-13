@@ -57,6 +57,12 @@ def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str
         gpu_name = torch.cuda.get_device_name(device_idx)
         props = torch.cuda.get_device_properties(device_idx)
         vram_gb = round(props.total_memory / (1024 ** 3), 2)
+        # Active preflight test: verify that CUDA kernels can actually execute
+        try:
+            test_t = torch.zeros(1, device=device_str)
+            del test_t
+        except Exception as exc:
+            print(f"[Worker] WARNING: CUDA device '{device_str}' ({gpu_name}) failed kernel execution preflight test: {exc}")
     else:
         gpu_name = platform.processor() or "CPU"
         vram_gb = 0.0
@@ -64,13 +70,19 @@ def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str
     return device_str, gpu_name, vram_gb
 
 
-def build_model_from_config(model_config: dict[str, Any], device: str) -> nn.Module:
-    """Instantiate a transformer model from configuration.
+def build_model_from_config(
+    model_config: dict[str, Any],
+    device: str,
+    logger: Optional[Callable[[str], None]] = None,
+) -> nn.Module:
+    """Instantiate a transformer model from configuration with detailed debug tracking.
 
     Attempts import from `engine.model_transformer.TransformerModel` first.
     Falls back to a standard PyTorch TransformerLM if engine is not installed.
     """
+    log = logger or (lambda msg: print(f"[ModelBuilder] {msg}"))
     try:
+        log(f"Importing engine components (ModelConfig, MicroGPT)...")
         from engine.config import ModelConfig
         from engine.model import MicroGPT
 
@@ -78,9 +90,19 @@ def build_model_from_config(model_config: dict[str, Any], device: str) -> nn.Mod
         valid_keys = ModelConfig.__dataclass_fields__.keys()
         filtered = {k: v for k, v in model_config.items() if k in valid_keys}
         cfg = ModelConfig(**filtered)
+        log(f"Instantiating MicroGPT on CPU (layers={cfg.layer_count}, heads={cfg.head_count}, embd={cfg.embedding_size}, vocab={cfg.vocab_size})...")
+        t0 = time.time()
         model = MicroGPT(cfg)
-        return model.to(device)
-    except (ImportError, Exception):
+        log(f"MicroGPT constructed on CPU in {time.time() - t0:.2f}s. Transferring parameters to {device}...")
+        t1 = time.time()
+        model = model.to(device)
+        log(f"Model parameters successfully transferred to {device} in {time.time() - t1:.2f}s.")
+        return model
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        log(f"MicroGPT initialization failed ({exc}). Falling back to minimal TransformerLM. Traceback:\n{tb}")
+
         # Fallback minimal transformer language model
         vocab_size = int(model_config.get("vocab_size", 1000))
         embed_dim = int(model_config.get("embedding_size", 128))
@@ -110,6 +132,7 @@ def build_model_from_config(model_config: dict[str, Any], device: str) -> nn.Mod
                 out = self.transformer(h, mask=mask, is_causal=True)
                 return self.lm_head(out)
 
+        log(f"Constructing FallbackLM on {device}...")
         return FallbackLM().to(device)
 
 
@@ -138,7 +161,16 @@ class ClusterWorker:
         self.heartbeat_interval = heartbeat_interval
         self._stop_event = threading.Event()
         self._current_job_id: Optional[str] = None
-        self._current_status: str = "IDLE"
+        self._current_status = "IDLE"
+        self._last_round_metrics: dict[str, Any] = {}
+
+        # Hardware preflight check
+        if self.device_str.startswith("cuda") and torch.cuda.is_available():
+            try:
+                t = torch.zeros(1, device=self.device_str)
+                del t
+            except Exception as exc:
+                self.log(f"CRITICAL PREFLIGHT WARNING: CUDA device '{self.device_str}' ({self.gpu_name}) failed tensor kernel execution: {exc}", level="ERROR")
 
         # Register worker in SQLite database and clear any stale pending command
         self.bus.register_worker(
@@ -460,10 +492,12 @@ class ClusterWorker:
                 dataloader_iter = iter(dataloader)
 
                 # Build model and optimizer
-                self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Initializing model on {self.device_str}...")
-                model = build_model_from_config(model_config, self.device_str)
+                self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
+                model = build_model_from_config(model_config, self.device_str, logger=self.log)
+                self.log(f"Model ready. Creating AdamW optimizer (lr={lr})...")
+                t_opt = time.time()
                 optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-                self.log(f"Model initialized on device '{self.device_str}'. Ready to train {max_rounds} rounds.")
+                self.log(f"Optimizer created in {time.time() - t_opt:.2f}s on '{self.device_str}'. Ready to train {max_rounds} rounds.")
             except Exception as exc:
                 import traceback
                 tb = traceback.format_exc()
