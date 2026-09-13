@@ -686,9 +686,24 @@ class ClusterWorker:
             try:
                 cmd = self.bus.get_worker_command(self.worker_id)
                 if cmd == "STOP":
-                    self.log("Received remote STOP command. Shutting down worker...")
+                    self.log("Received STOP command. Aborting active training and returning to IDLE...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._abort_active_job = True
+                    self._current_status = "IDLE"
+                    self._current_job_id = None
+                    try:
+                        self.bus.heartbeat(
+                            worker_id=self.worker_id,
+                            status="IDLE",
+                            current_job_id=None,
+                        )
+                    except Exception:
+                        pass
+                elif cmd == "SHUTDOWN":
+                    self.log("Received SHUTDOWN command. Exiting worker process...")
                     self.bus.set_worker_command(self.worker_id, None)
                     self._stop_event.set()
+                    self._cleanup_child_worker_procs()
                     self._current_status = "OFFLINE"
                     try:
                         self.bus.heartbeat(
@@ -706,32 +721,39 @@ class ClusterWorker:
                 elif cmd == "RESTART":
                     self.log("Received remote RESTART command. Respawning worker process...")
                     self.bus.set_worker_command(self.worker_id, None)
-                    self._stop_event.set()
-                    self._current_status = "OFFLINE"
-                    try:
-                        self.bus.heartbeat(
-                            worker_id=self.worker_id,
-                            status="OFFLINE",
-                            current_job_id=None,
-                        )
-                    except Exception:
-                        pass
-                    from .cluster_worker import release_singleton_lock, get_device_tag
+                    self._cleanup_child_worker_procs()
+                    from .cluster_worker import release_singleton_lock, get_device_tag, get_worker_respawn_cmd
                     if not self.allow_shared_device:
                         release_singleton_lock(get_device_tag(self.device_str))
                     release_singleton_lock(f"wid_{self.worker_id}")
-                    time.sleep(0.3)
+
+                    cmd_args = get_worker_respawn_cmd(
+                        worker_id=self.worker_id,
+                        device_str=self.device_str,
+                        shared_dir=self.bus.shared_dir,
+                        allow_shared_device=self.allow_shared_device,
+                    )
                     flags = 0
                     if sys.platform == "win32":
                         DETACHED_PROCESS = 0x00000008
                         CREATE_NEW_PROCESS_GROUP = 0x00000200
                         CREATE_NO_WINDOW = 0x08000000
                         flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-                    subprocess.Popen(
-                        [sys.executable] + sys.argv,
-                        creationflags=flags,
-                        close_fds=True,
-                    )
+                    log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
+                    log_file = open(log_path, "a", encoding="utf-8")
+                    try:
+                        proc = subprocess.Popen(
+                            cmd_args,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                            creationflags=flags,
+                            close_fds=True,
+                        )
+                        self.log(f"Successfully respawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
+                    except Exception as exc:
+                        self.log(f"Failed to spawn new worker process: {exc}", level="ERROR")
+                    self._stop_event.set()
+                    time.sleep(0.3)
                     os._exit(0)
 
                 metrics = collect_system_metrics(self.device_str, getattr(self, "vram_gb", 0.0))
@@ -955,7 +977,7 @@ class ClusterWorker:
             scaler = self._scaler
 
         for step in range(steps_per_round):
-            if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+            if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                 break
 
             # Handle cooperative pause
@@ -1254,9 +1276,10 @@ class ClusterWorker:
             current_round = int(job.get("current_round", 0))
 
             while current_round < max_rounds and not self._stop_event.is_set():
-                if self.bus.is_stopped(job_id):
-                    self._current_status = "STOPPED"
-                    self.log(f"Job {job_id} stopped.")
+                if self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
+                    self._current_status = "IDLE"
+                    self._current_job_id = None
+                    self.log(f"Job {job_id} stopped. Returning to IDLE.")
                     return False
 
                 # Operator disable guard: exit cleanly if worker was disabled mid-job
@@ -1306,7 +1329,7 @@ class ClusterWorker:
                 if current_round > 0:
                     self._current_status = "SYNC_WAIT"
                     while not self.bus.is_global_weights_ready(job_id, current_round - 1):
-                        if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                        if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                             return False
                         time.sleep(poll_interval)
 
@@ -1382,7 +1405,7 @@ class ClusterWorker:
 
                 # Wait for coordinator to publish global model for this round
                 while not self.bus.is_global_weights_ready(job_id, current_round):
-                    if self._stop_event.is_set() or self.bus.is_stopped(job_id):
+                    if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                         return False
                     time.sleep(poll_interval)
 
@@ -1398,6 +1421,7 @@ class ClusterWorker:
             self._current_status = "ERROR"
             raise
         finally:
+            self._abort_active_job = False
             # Terminate and reap auxiliary worker subprocesses (primary worker only)
             if self.ephemeral_job_id is None:
                 self._cleanup_child_worker_procs()
@@ -1423,6 +1447,14 @@ class ClusterWorker:
                     torch.cuda.ipc_collect()
                 except Exception:
                     pass
+
+            if self._current_status not in ("ERROR", "OFFLINE"):
+                self._current_status = "IDLE"
+            self._current_job_id = None
+            try:
+                self.bus.heartbeat(self.worker_id, status=self._current_status, current_job_id=None)
+            except Exception:
+                pass
 
     def run_hardware_preflight(self) -> tuple[bool, list[str]]:
         """Execute comprehensive hardware, storage, and runtime preflight validation.

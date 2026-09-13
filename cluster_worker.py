@@ -238,20 +238,26 @@ def get_all_running_worker_pids() -> dict[str, int]:
     return res
 
 
-def acquire_singleton_lock(device_tag: str = "default") -> bool:
+def acquire_singleton_lock(device_tag: str = "default", timeout_seconds: float = 0.0) -> bool:
     """Ensure only one cluster worker process runs per device or worker ID on this host."""
     lock_path = get_lock_file(device_tag)
-    if lock_path.exists():
-        try:
-            old_pid = int(lock_path.read_text().strip())
-            if is_pid_running(old_pid):
-                tag_label = f"worker ID '{device_tag[4:]}'" if device_tag.startswith("wid_") else f"device '{device_tag}'"
-                print(f"[ClusterWorker] A worker is already running for {tag_label} (PID: {old_pid}). Exiting.")
-                return False
-            else:
-                lock_path.unlink(missing_ok=True)
-        except (ValueError, OSError):
-            pass
+    deadline = time.time() + max(timeout_seconds, 0.0)
+    while True:
+        if lock_path.exists():
+            try:
+                old_pid = int(lock_path.read_text().strip())
+                if is_pid_running(old_pid):
+                    if time.time() < deadline:
+                        time.sleep(0.1)
+                        continue
+                    tag_label = f"worker ID '{device_tag[4:]}'" if device_tag.startswith("wid_") else f"device '{device_tag}'"
+                    print(f"[ClusterWorker] A worker is already running for {tag_label} (PID: {old_pid}). Exiting.")
+                    return False
+                else:
+                    lock_path.unlink(missing_ok=True)
+            except (ValueError, OSError):
+                pass
+        break
 
     try:
         lock_path.write_text(str(os.getpid()))
@@ -260,6 +266,59 @@ def acquire_singleton_lock(device_tag: str = "default") -> bool:
     except Exception as exc:
         print(f"[ClusterWorker] Warning: could not write lockfile: {exc}")
         return True
+
+
+def get_worker_respawn_cmd(
+    worker_id: str,
+    device_str: str,
+    shared_dir: Union[str, Path],
+    allow_shared_device: bool = False,
+) -> list[str]:
+    """Construct a clean, robust command to respawn a worker process."""
+    # 1. Check sys.orig_argv (Python 3.10+)
+    if hasattr(sys, "orig_argv") and sys.orig_argv:
+        cmd = list(sys.orig_argv)
+        cmd[0] = sys.executable
+        if len(cmd) > 1 and not cmd[1].startswith("-"):
+            p = Path(cmd[1])
+            if p.exists() or Path(p.resolve()).exists():
+                cmd[1] = str(p.resolve())
+        return cmd
+
+    # 2. Check if invoked via module
+    script = sys.argv[0] if sys.argv else ""
+    if script.endswith("cli.py") or "cluster.cli" in script or (len(sys.argv) > 1 and sys.argv[1] == "worker"):
+        cmd = [
+            sys.executable,
+            "-m",
+            "cluster.cli",
+            "worker",
+            "--shared-dir",
+            str(shared_dir),
+            "--worker-id",
+            worker_id,
+            "--device",
+            device_str,
+        ]
+        if allow_shared_device:
+            cmd.append("--allow-shared-device")
+        return cmd
+
+    # 3. Direct script fallback (e.g. cluster_worker.py)
+    script_path = Path(script).resolve() if script else Path.cwd() / "cluster_worker.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--shared-dir",
+        str(shared_dir),
+        "--worker-id",
+        worker_id,
+        "--device",
+        device_str,
+    ]
+    if allow_shared_device:
+        cmd.append("--allow-shared-device")
+    return cmd
 
 
 def release_singleton_lock(device_tag: str = "default") -> None:
@@ -1652,9 +1711,15 @@ class StandaloneWorker:
                 atexit.unregister(self._cleanup_func)
             except Exception:
                 pass
-        self._heartbeat(status="OFFLINE", current_job_id=None)
         release_singleton_lock(self.device_tag)
-        time.sleep(0.3)
+        release_singleton_lock(f"wid_{self.worker_id}")
+
+        cmd_args = get_worker_respawn_cmd(
+            worker_id=self.worker_id,
+            device_str=self.device_str,
+            shared_dir=self.bus.shared_dir,
+            allow_shared_device=self.allow_shared_device,
+        )
         try:
             flags = 0
             if sys.platform == "win32":
@@ -1662,18 +1727,20 @@ class StandaloneWorker:
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 CREATE_NO_WINDOW = 0x08000000
                 flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-            log_path = Path(tempfile.gettempdir()) / "cluster_worker_local.log"
+            log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
             log_file = open(log_path, "a", encoding="utf-8")
-            subprocess.Popen(
-                [sys.executable] + sys.argv,
+            proc = subprocess.Popen(
+                cmd_args,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=flags,
                 close_fds=True,
             )
+            self.log(f"Successfully spawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
         except Exception as exc:
             self.log(f"Failed to respawn worker process: {exc}", level="ERROR")
-        sys.exit(0)
+        time.sleep(0.3)
+        os._exit(0)
 
     def run(self, poll_interval: float = 3.0) -> None:
         """Main worker loop: registers heartbeat, claims jobs, and trains across rounds."""
@@ -1686,6 +1753,7 @@ class StandaloneWorker:
             try:
                 self.bus.heartbeat(self.worker_id, status="OFFLINE", current_job_id=None)
                 release_singleton_lock(self.device_tag)
+                release_singleton_lock(f"wid_{self.worker_id}")
             except Exception:
                 pass
 
@@ -1704,13 +1772,19 @@ class StandaloneWorker:
             try:
                 cmd = self.bus.get_worker_command(self.worker_id)
                 if cmd == "STOP":
-                    self.log(f"Received STOP command. Shutting down...")
+                    self.log("Received STOP command. Setting status to IDLE and waiting for job...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._abort_active_job = True
+                    self._heartbeat(status="IDLE", current_job_id=None)
+                elif cmd == "SHUTDOWN":
+                    self.log("Received SHUTDOWN command. Shutting down worker process...")
                     self.bus.set_worker_command(self.worker_id, None)
                     self._heartbeat(status="OFFLINE", current_job_id=None)
                     release_singleton_lock(self.device_tag)
-                    sys.exit(0)
+                    release_singleton_lock(f"wid_{self.worker_id}")
+                    os._exit(0)
                 elif cmd == "RESTART":
-                    self.log(f"Received RESTART command. Respawning process...")
+                    self.log("Received RESTART command. Respawning process...")
                     self._restart_process()
 
                 # Check if worker is disabled by operator: remain active and heartbeating, but do not claim jobs
@@ -1989,17 +2063,23 @@ class StandaloneWorker:
 
         try:
             while cur_round < max_rounds:
-                if self.bus.is_stopped(job_id):
-                    self.log(f"Job {job_id} stopped.")
+                if self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
+                    self.log(f"Job {job_id} stopped. Returning to IDLE.")
                     break
 
                 cmd = self.bus.get_worker_command(self.worker_id)
                 if cmd == "STOP":
-                    self.log(f"Received STOP command during job {job_id}.")
+                    self.log(f"Received STOP command during job {job_id}. Aborting job and returning to IDLE...")
+                    self.bus.set_worker_command(self.worker_id, None)
+                    self._abort_active_job = True
+                    break
+                elif cmd == "SHUTDOWN":
+                    self.log(f"Received SHUTDOWN command during job {job_id}. Shutting down worker...")
                     self.bus.set_worker_command(self.worker_id, None)
                     self._heartbeat(status="OFFLINE", current_job_id=None)
                     release_singleton_lock(self.device_tag)
-                    sys.exit(0)
+                    release_singleton_lock(f"wid_{self.worker_id}")
+                    os._exit(0)
                 elif cmd == "RESTART":
                     self.log(f"Received RESTART command during job {job_id}.")
                     self._restart_process()
@@ -2045,17 +2125,23 @@ class StandaloneWorker:
                     if step_idx % 5 == 0:
                         cmd = self.bus.get_worker_command(self.worker_id)
                         if cmd == "STOP":
-                            self.log("Received STOP command during training. Shutting down...")
+                            self.log("Received STOP command during training. Aborting job and returning to IDLE...")
+                            self.bus.set_worker_command(self.worker_id, None)
+                            self._abort_active_job = True
+                            return
+                        elif cmd == "SHUTDOWN":
+                            self.log("Received SHUTDOWN command during training. Shutting down...")
                             self.bus.set_worker_command(self.worker_id, None)
                             self._heartbeat(status="OFFLINE", current_job_id=None)
                             release_singleton_lock(self.device_tag)
-                            sys.exit(0)
+                            release_singleton_lock(f"wid_{self.worker_id}")
+                            os._exit(0)
                         elif cmd == "RESTART":
                             self.log("Received RESTART command during training. Restarting process...")
                             self._restart_process()
                     if step_idx % 20 == 0:
                         self._heartbeat(status="TRAINING", current_job_id=job_id)
-                    if self.bus.is_stopped(job_id):
+                    if self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                         self.log(f"Job {job_id} stopped. Aborting training loop.")
                         return
                     try:
@@ -2201,9 +2287,8 @@ class StandaloneWorker:
                     pass
 
             try:
-                cmd = self.bus.get_worker_command(self.worker_id)
-                if cmd != "STOP":
-                    self._heartbeat(status="IDLE", current_job_id=None)
+                self._abort_active_job = False
+                self._heartbeat(status="IDLE", current_job_id=None)
             except Exception:
                 pass
 
@@ -2304,11 +2389,11 @@ def main() -> int:
     device_tag = get_device_tag(resolved_device)
 
     # Enforce per-device singleton
-    if not acquire_singleton_lock(device_tag):
+    if not acquire_singleton_lock(device_tag, timeout_seconds=3.0):
         return 0
 
     wid_tag = f"wid_{args.worker_id}" if args.worker_id else None
-    if wid_tag and not acquire_singleton_lock(wid_tag):
+    if wid_tag and not acquire_singleton_lock(wid_tag, timeout_seconds=3.0):
         release_singleton_lock(device_tag)
         return 0
 
