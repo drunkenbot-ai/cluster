@@ -538,6 +538,60 @@ def get_worker_executable() -> str:
 # 3. Embedded SQLite WAL Bus Client
 # =============================================================================
 
+def safe_torch_load(
+    path: Path | str,
+    device: str = "cpu",
+    max_retries: int = 5,
+    retry_delay: float = 0.5,
+) -> Any:
+    """Safely load PyTorch checkpoint with retry and local temporary caching to prevent Windows SMB Errno 22."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+
+    is_net = False
+    p_str = str(p)
+    if p_str.startswith(("\\\\", "//")):
+        is_net = True
+    elif len(p_str) >= 2 and p_str[1] == ":" and sys.platform == "win32":
+        try:
+            import ctypes
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(f"{p_str[:2].upper()}\\")
+            is_net = (drive_type == 4)  # DRIVE_REMOTE
+        except Exception:
+            is_net = False
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            if is_net:
+                temp_fd, temp_path = tempfile.mkstemp(suffix=".pt", prefix=f".llm_load_{os.getpid()}_")
+                os.close(temp_fd)
+                try:
+                    shutil.copyfile(str(p), temp_path)
+                    data = torch.load(temp_path, map_location=device)
+                    return data
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+            else:
+                return torch.load(str(p), map_location=device)
+        except (OSError, RuntimeError) as exc:
+            last_err = exc
+            time.sleep(retry_delay * (attempt + 1))
+        except Exception as exc:
+            last_err = exc
+            time.sleep(retry_delay * (attempt + 1))
+
+    if is_net:
+        return torch.load(str(p), map_location=device)
+    if last_err:
+        raise last_err
+    return torch.load(str(p), map_location=device)
+
+
 class StandaloneStorageBus:
     """Self-contained storage bus client operating over central shared network storage."""
 
@@ -929,7 +983,11 @@ class StandaloneStorageBus:
 
     def load_global_weights(self, job_id: str, round_num: int, device: str = "cpu") -> dict[str, torch.Tensor]:
         weight_path = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}" / "global_model.pt"
-        return torch.load(weight_path, map_location=device)
+        return safe_torch_load(weight_path, device=device)
+
+
+
+
 
     def get_checkpoints_dir(self, job_id: str) -> Path:
         ckpt_dir = self.jobs_dir / job_id / "checkpoints"
@@ -966,10 +1024,10 @@ class StandaloneStorageBus:
         ckpt_dir = self.get_checkpoints_dir(job_id)
         latest = ckpt_dir / "latest_checkpoint.pt"
         if latest.exists():
-            return torch.load(latest, map_location=device)
+            return safe_torch_load(latest, device=device)
         final = ckpt_dir / "final_model.pt"
         if final.exists():
-            return torch.load(final, map_location=device)
+            return safe_torch_load(final, device=device)
         return None
 
     def write_worker_logs(self, entries: list[tuple[str, float, str, str]]) -> None:
