@@ -126,6 +126,8 @@ def cache_dataset_to_local(
 
     remote_file = Path(remote_path)
     local_file = cache_dir / remote_file.name
+    lock_file = cache_dir / f".{remote_file.name}.lock"
+    temp_file = cache_dir / f".{remote_file.name}.tmp_{os.getpid()}"
 
     try:
         remote_stat = remote_file.stat()
@@ -133,12 +135,48 @@ def cache_dataset_to_local(
         remote_size_gb = remote_size / (1024 ** 3)
         remote_mtime = remote_stat.st_mtime
 
-        # Check if current file is already cached with identical size & mtime
+        # Fast path: check if local file is already fully cached and valid
         if local_file.exists():
-            local_stat = local_file.stat()
-            if local_stat.st_size == remote_size and abs(local_stat.st_mtime - remote_mtime) < 2.0:
-                log(f"[DatasetCache] Verified existing local SSD dataset cache: {local_file.name} ({remote_size_gb:.2f} GB)")
-                return str(local_file)
+            try:
+                local_stat = local_file.stat()
+                if local_stat.st_size == remote_size and abs(local_stat.st_mtime - remote_mtime) < 2.0:
+                    log(f"[DatasetCache] Verified existing local SSD dataset cache: {local_file.name} ({remote_size_gb:.2f} GB)")
+                    return str(local_file)
+            except Exception:
+                pass
+
+        # Multi-process coordination: if another slot process on this node is currently caching, wait for it
+        if lock_file.exists():
+            try:
+                lock_age = time.time() - lock_file.stat().st_mtime
+                if lock_age < 600:
+                    log(f"[DatasetCache] Another slot on this node is currently caching {remote_file.name}. Waiting for local transfer to finish...")
+                    wait_start = time.time()
+                    while lock_file.exists() and (time.time() - wait_start < 180):
+                        time.sleep(1.0)
+                        if local_file.exists():
+                            try:
+                                if local_file.stat().st_size == remote_size:
+                                    log(f"[DatasetCache] Local SSD dataset ready from concurrent slot: {local_file.name} ({remote_size_gb:.2f} GB)")
+                                    return str(local_file)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # Check again if file became available while checking/waiting
+        if local_file.exists():
+            try:
+                if local_file.stat().st_size == remote_size:
+                    return str(local_file)
+            except Exception:
+                pass
+
+        # Claim the lock for this process
+        try:
+            lock_file.write_text(str(os.getpid()), encoding="utf-8")
+        except Exception:
+            pass
 
         # Purge stale .npy files from cache before copying new to keep local storage clean
         effective_keep = set(keep_files or ())
@@ -154,19 +192,42 @@ def cache_dataset_to_local(
                 f"({free_gb:.1f} GB free vs {remote_size_gb:.1f} GB required). Falling back to direct network share.",
                 level="WARNING",
             )
+            try:
+                if lock_file.exists():
+                    lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
             return remote_path
 
         log(f"[DatasetCache] Streaming network dataset {remote_file.name} ({remote_size_gb:.2f} GB) to local SSD ({local_file})...")
         t0 = time.time()
-        buf_size = 64 * 1024 * 1024  # 64 MB buffered streaming
-        with open(str(remote_file), "rb") as src, open(str(local_file), "wb") as dst:
-            while True:
-                chunk = src.read(buf_size)
-                if not chunk:
-                    break
-                dst.write(chunk)
 
-        os.utime(str(local_file), (remote_mtime, remote_mtime))
+        # Safe 4MB buffer chunks to avoid Windows SMB Errno 22 (ERROR_INVALID_PARAMETER)
+        buf_size = 4 * 1024 * 1024
+        try:
+            with open(str(remote_file), "rb") as src, open(str(temp_file), "wb") as dst:
+                while True:
+                    chunk = src.read(buf_size)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+        except OSError as os_err:
+            log(f"[DatasetCache] Chunked stream encountered {os_err}, attempting fallback via shutil.copyfile...", level="WARNING")
+            shutil.copyfile(str(remote_file), str(temp_file))
+
+        # Atomically move temp_file into local_file
+        temp_file.replace(local_file)
+        try:
+            os.utime(str(local_file), (remote_mtime, remote_mtime))
+        except Exception:
+            pass
+
+        try:
+            if lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
         elapsed = max(time.time() - t0, 0.001)
         speed_mb_s = (remote_size / (1024 * 1024)) / elapsed
         log(f"[DatasetCache] Cache transfer completed in {elapsed:.1f}s ({speed_mb_s:.1f} MB/s). Ready for zero-latency local training.")
@@ -175,6 +236,13 @@ def cache_dataset_to_local(
         import traceback
         tb = traceback.format_exc()
         log(f"[DatasetCache] Failed to cache dataset to local SSD ({exc}). Falling back to network share.\nTraceback:\n{tb}", level="WARNING")
+        try:
+            if temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+            if lock_file.exists():
+                lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
         return remote_path
 
 
@@ -227,10 +295,12 @@ def calculate_optimal_worker_slots(
         cuda_overhead = 1024 ** 3
 
         total_job_bytes = param_bytes + activation_bytes + cuda_overhead
-        estimated_job_gb = max(round(total_job_bytes / (1024 ** 3), 2), 4.0)
+        # In practice, each active worker requires at least 6.5 GB VRAM for model weights,
+        # fp32 AdamW moments, master weights, gradients, PyTorch CUDA context, and activation cache.
+        estimated_job_gb = max(round(total_job_bytes / (1024 ** 3), 2), 6.5)
 
-    # Calculate slots: allow 1.05x safety margin
-    slots = max(1, min(4, int(node_vram_gb // (estimated_job_gb * 1.05))))
+    # Calculate slots: allow 1.10x safety headroom
+    slots = max(1, min(4, int(node_vram_gb // (estimated_job_gb * 1.10))))
     return slots, estimated_job_gb, node_vram_gb
 
 
