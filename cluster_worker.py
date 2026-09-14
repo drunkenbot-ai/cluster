@@ -50,31 +50,200 @@ if hasattr(sys.stderr, "reconfigure"):
 # 1. Hardware Detection & Dependency Auto-Bootstrapping
 # =============================================================================
 
+# Dictionary mapping RTX and modern NVIDIA GPU models to their required CUDA wheel version.
+# Keys are normalized (uppercase, single-spaced) GPU model identifiers.
+RTX_CUDA_MAP: dict[str, str] = {
+    # -------------------------------------------------------------------------
+    # GeForce RTX 50 Series (Blackwell Architecture - Requires CUDA 12.8+)
+    # -------------------------------------------------------------------------
+    "RTX 5090": "cu128",
+    "RTX 5090 D": "cu128",
+    "RTX 5080": "cu128",
+    "RTX 5070 TI": "cu128",
+    "RTX 5070": "cu128",
+    "RTX 5060 TI": "cu128",
+    "RTX 5060": "cu128",
+    "RTX 5050": "cu128",
+
+    # -------------------------------------------------------------------------
+    # GeForce RTX 40 Series (Ada Lovelace Architecture - Optimal on CUDA 12.8)
+    # -------------------------------------------------------------------------
+    "RTX 4090": "cu128",
+    "RTX 4090 D": "cu128",
+    "RTX 4080 SUPER": "cu128",
+    "RTX 4080": "cu128",
+    "RTX 4070 TI SUPER": "cu128",
+    "RTX 4070 TI": "cu128",
+    "RTX 4070 SUPER": "cu128",
+    "RTX 4070": "cu128",
+    "RTX 4060 TI": "cu128",
+    "RTX 4060": "cu128",
+    "RTX 4050": "cu128",
+
+    # -------------------------------------------------------------------------
+    # RTX Workstation & Professional (Ada Lovelace Architecture)
+    # -------------------------------------------------------------------------
+    "RTX 6000 ADA": "cu128",
+    "RTX 5000 ADA": "cu128",
+    "RTX 4500 ADA": "cu128",
+    "RTX 4000 ADA": "cu128",
+    "RTX 4000 SFF ADA": "cu128",
+    "RTX 3500 ADA": "cu128",
+    "RTX 3000 ADA": "cu128",
+    "RTX 2000 ADA": "cu128",
+    "RTX 1000 ADA": "cu128",
+    "RTX 500 ADA": "cu128",
+
+    # -------------------------------------------------------------------------
+    # GeForce RTX 30 Series (Ampere Architecture - Optimal on CUDA 12.8)
+    # -------------------------------------------------------------------------
+    "RTX 3090 TI": "cu128",
+    "RTX 3090": "cu128",
+    "RTX 3080 TI": "cu128",
+    "RTX 3080": "cu128",
+    "RTX 3070 TI": "cu128",
+    "RTX 3070": "cu128",
+    "RTX 3060 TI": "cu128",
+    "RTX 3060": "cu128",
+    "RTX 3050": "cu128",
+
+    # -------------------------------------------------------------------------
+    # RTX Workstation & Professional (Ampere Architecture)
+    # -------------------------------------------------------------------------
+    "RTX A6000": "cu128",
+    "RTX A5500": "cu128",
+    "RTX A5000": "cu128",
+    "RTX A4500": "cu128",
+    "RTX A4000": "cu128",
+    "RTX A3000": "cu128",
+    "RTX A2000": "cu128",
+    "RTX A1000": "cu128",
+    "RTX A500": "cu128",
+    "RTX A400": "cu128",
+
+    # -------------------------------------------------------------------------
+    # GeForce RTX 20 Series & Titan (Turing Architecture - CUDA 12.8)
+    # -------------------------------------------------------------------------
+    "RTX 2080 TI": "cu128",
+    "RTX 2080 SUPER": "cu128",
+    "RTX 2080": "cu128",
+    "RTX 2070 SUPER": "cu128",
+    "RTX 2070": "cu128",
+    "RTX 2060 SUPER": "cu128",
+    "RTX 2060": "cu128",
+    "TITAN RTX": "cu128",
+
+    # -------------------------------------------------------------------------
+    # Quadro RTX Series
+    # -------------------------------------------------------------------------
+    "QUADRO RTX 8000": "cu128",
+    "QUADRO RTX 6000": "cu128",
+    "QUADRO RTX 5000": "cu128",
+    "QUADRO RTX 4000": "cu128",
+    "QUADRO RTX 3000": "cu128",
+
+    # -------------------------------------------------------------------------
+    # Data Center & Cloud Accelerators
+    # -------------------------------------------------------------------------
+    "B200": "cu128",
+    "B100": "cu128",
+    "GB200": "cu128",
+    "H200": "cu128",
+    "H100": "cu128",
+    "L40S": "cu128",
+    "L40": "cu128",
+    "L4": "cu128",
+    "A100": "cu128",
+    "A40": "cu128",
+    "A30": "cu128",
+    "A16": "cu128",
+    "A10": "cu128",
+    "A2": "cu128",
+    "V100": "cu128",
+    "T4": "cu128",
+
+    # -------------------------------------------------------------------------
+    # Legacy NVIDIA Architecture (Pascal - CUDA 12.4)
+    # -------------------------------------------------------------------------
+    "GTX 1080 TI": "cu124",
+    "GTX 1080": "cu124",
+    "GTX 1070 TI": "cu124",
+    "GTX 1070": "cu124",
+    "GTX 1060": "cu124",
+}
+
+
+def _find_nvidia_smi() -> Optional[str]:
+    """Find the path to the nvidia-smi executable on Windows or Linux."""
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        return exe
+    if sys.platform == "win32":
+        # Check standard Windows paths if nvidia-smi is not in user PATH
+        candidates = [
+            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvidia-smi.exe",
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "NVIDIA Corporation" / "NVSMI" / "nvidia-smi.exe",
+        ]
+        for c in candidates:
+            if c.is_file():
+                return str(c)
+    return None
+
+
+def resolve_cuda_version_for_gpu(gpu_name: str) -> Optional[str]:
+    """Determine the optimal CUDA wheel version ('cu128', 'cu124', etc.) for a given GPU name.
+
+    Returns None if the device is CPU or an unrecognized non-CUDA device.
+    """
+    if not gpu_name:
+        return None
+
+    forced = os.environ.get("LLM_FORCE_CUDA_VERSION") or os.environ.get("LLM_CUDA_VERSION")
+    if forced:
+        forced = forced.strip().lower()
+        if not forced.startswith("cu") and forced != "cpu":
+            forced = f"cu{forced.replace('.', '')}"
+        return forced
+
+    raw = gpu_name.upper().replace("-", " ").replace("_", " ")
+    for noise in ["NVIDIA", "GEFORCE", "GRAPHICS", "LAPTOP GPU", "GENERATION", "(R)", "(TM)", "WITH MAX-Q DESIGN"]:
+        raw = raw.replace(noise, " ")
+    cleaned = " ".join(raw.split())
+
+    # 1. Exact match in dictionary
+    if cleaned in RTX_CUDA_MAP:
+        return RTX_CUDA_MAP[cleaned]
+
+    # 2. Key contains match (longer keys first to match "RTX 4070 TI" before "RTX 4070")
+    for key, cuda_ver in sorted(RTX_CUDA_MAP.items(), key=lambda x: len(x[0]), reverse=True):
+        if key in cleaned:
+            return cuda_ver
+
+    # 3. Any RTX card fallback -> cu128
+    if "RTX" in cleaned:
+        return "cu128"
+
+    # 4. Pascal legacy card fallback -> cu124
+    if "GTX 10" in cleaned:
+        return "cu124"
+
+    # 5. Generic NVIDIA GPU fallback
+    if "NVIDIA" in gpu_name.upper() or "GTX" in cleaned or "QUADRO" in cleaned or "TESLA" in cleaned:
+        return "cu128"
+
+    return None
+
+
 def detect_all_gpus() -> list[dict[str, Any]]:
-    """Detect all compute GPUs available on the host machine."""
+    """Detect all compute GPUs available on the host machine without prematurely importing torch."""
     gpus: list[dict[str, Any]] = []
 
-    # 1. Check PyTorch CUDA if available
-    try:
-        import torch
-        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                gpus.append({
-                    "index": i,
-                    "device": f"cuda:{i}",
-                    "name": torch.cuda.get_device_name(i),
-                    "vram_gb": round(props.total_memory / (1024 ** 3), 2),
-                })
-            return gpus
-    except Exception:
-        pass
-
-    # 2. Check nvidia-smi command directly
-    if shutil.which("nvidia-smi"):
+    # 1. Prefer querying nvidia-smi directly (fast, accurate, doesn't lock torch DLLs)
+    smi = _find_nvidia_smi()
+    if smi:
         try:
             out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
+                [smi, "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
                 text=True,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
@@ -96,6 +265,48 @@ def detect_all_gpus() -> list[dict[str, Any]]:
         except Exception:
             pass
 
+    # 2. Check Windows WMI if nvidia-smi is not available
+    if sys.platform == "win32":
+        try:
+            wmi_out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            gpu_idx = 0
+            for line in wmi_out.strip().splitlines():
+                line = line.strip()
+                if "NVIDIA" in line.upper():
+                    gpus.append({
+                        "index": gpu_idx,
+                        "device": f"cuda:{gpu_idx}",
+                        "name": line,
+                        "vram_gb": 0.0,
+                    })
+                    gpu_idx += 1
+            if gpus:
+                return gpus
+        except Exception:
+            pass
+
+    # 3. Fallback to PyTorch CUDA if torch is already imported or available
+    if "torch" in sys.modules:
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                for i in range(torch.cuda.device_count()):
+                    props = torch.cuda.get_device_properties(i)
+                    gpus.append({
+                        "index": i,
+                        "device": f"cuda:{i}",
+                        "name": torch.cuda.get_device_name(i),
+                        "vram_gb": round(props.total_memory / (1024 ** 3), 2),
+                    })
+                return gpus
+        except Exception:
+            pass
+
     # Fallback to CPU
     return [{
         "index": -1,
@@ -105,30 +316,140 @@ def detect_all_gpus() -> list[dict[str, Any]]:
     }]
 
 
+def get_installed_torch_status() -> tuple[Optional[str], Optional[str], bool]:
+    """Inspect current torch installation without importing torch into the current process.
+
+    Returns:
+        (torch_version_str, cuda_tag, is_cuda_available)
+        e.g. ("2.6.0+cu124", "cu124", True) or (None, None, False) if not installed.
+    """
+    version_str: Optional[str] = None
+    try:
+        import importlib.metadata
+        version_str = importlib.metadata.version("torch")
+    except Exception:
+        version_str = None
+
+    if not version_str:
+        return None, None, False
+
+    cuda_tag: Optional[str] = None
+    if "+cu" in version_str:
+        cuda_tag = "cu" + version_str.split("+cu")[-1].split(".")[0].split("+")[0]
+    elif "+cpu" in version_str:
+        cuda_tag = "cpu"
+
+    # Verify runtime CUDA availability using a lightweight subprocess probe
+    # to avoid loading torch DLLs into the worker process if uninstallation is needed.
+    is_cuda_avail = False
+    try:
+        probe_code = (
+            "import torch; "
+            "print('CUDA_AVAIL=' + str(bool(torch.cuda.is_available())) + "
+            "';CUDA_VER=' + str(getattr(torch.version, 'cuda', '') or ''))"
+        )
+        out = subprocess.check_output(
+            [sys.executable, "-c", probe_code],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        for part in out.strip().split(";"):
+            if part.startswith("CUDA_AVAIL="):
+                is_cuda_avail = part.split("=")[1].strip().lower() == "true"
+            elif part.startswith("CUDA_VER="):
+                sub_ver = part.split("=")[1].strip()
+                if sub_ver and not cuda_tag:
+                    cuda_tag = "cu" + sub_ver.replace(".", "")
+    except Exception:
+        pass
+
+    return version_str, cuda_tag, is_cuda_avail
+
+
 def ensure_dependencies() -> None:
-    """Ensure torch and numpy are installed with CUDA support if an NVIDIA GPU is present."""
-    missing = []
+    """Ensure torch and numpy are installed with the exact CUDA wheel matching the host's GPU."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("LLM_TEST_BOOTSTRAP_EXECUTE"):
+        return
+
+    # 1. Check for numpy
+    missing_numpy = False
     try:
         import numpy  # noqa: F401
     except ImportError:
-        missing.append("numpy")
+        missing_numpy = True
 
-    has_nvidia = bool(shutil.which("nvidia-smi"))
-    need_cuda_torch = False
+    # 2. Discover physical GPUs
+    detected_gpus = detect_all_gpus()
+    has_nvidia = any(g.get("device", "").startswith("cuda") for g in detected_gpus)
 
-    try:
-        import torch
-        if has_nvidia and not torch.cuda.is_available():
-            need_cuda_torch = True
-    except ImportError:
-        missing.append("torch")
-        if has_nvidia:
-            need_cuda_torch = True
+    # 3. Determine target CUDA version for the detected hardware
+    target_cuda: Optional[str] = None
+    target_gpu_name = ""
+    is_rtx_detected = False
+    if has_nvidia:
+        for g in detected_gpus:
+            gname = g.get("name", "")
+            cuda_ver = resolve_cuda_version_for_gpu(gname)
+            if "RTX" in gname.upper():
+                is_rtx_detected = True
+            if cuda_ver:
+                target_cuda = cuda_ver
+                target_gpu_name = gname
+                break
+        if not target_cuda:
+            target_cuda = "cu128"
+            target_gpu_name = detected_gpus[0].get("name", "NVIDIA GPU")
 
-    if missing or need_cuda_torch:
-        print(f"[ClusterWorker] Preparing environment (missing={missing}, need_cuda={need_cuda_torch})...")
+    # 4. Inspect current installed PyTorch
+    installed_ver, installed_cuda_tag, is_cuda_avail = get_installed_torch_status()
 
-        # 1. Check for offline wheels cache in shared directory
+    need_uninstall = False
+    need_install = False
+    reason = ""
+
+    if target_cuda:
+        if installed_ver is None:
+            need_install = True
+            reason = f"PyTorch is not installed (target: {target_cuda} for {target_gpu_name})"
+        elif not is_cuda_avail:
+            need_uninstall = True
+            need_install = True
+            reason = f"Installed PyTorch ({installed_ver}) lacks working CUDA for {target_gpu_name} (needs {target_cuda})"
+        elif is_rtx_detected and installed_cuda_tag != target_cuda:
+            need_uninstall = True
+            need_install = True
+            reason = f"GPU {target_gpu_name} requires {target_cuda}, but installed PyTorch has {installed_cuda_tag} ({installed_ver})"
+        elif os.environ.get("LLM_FORCE_CUDA_VERSION") and installed_cuda_tag != target_cuda:
+            need_uninstall = True
+            need_install = True
+            reason = f"Forced CUDA {target_cuda} requested, but installed PyTorch has {installed_cuda_tag}"
+    else:
+        if installed_ver is None:
+            need_install = True
+            reason = "PyTorch is not installed (CPU mode)"
+
+    if not need_uninstall and not need_install and not missing_numpy:
+        return
+
+    print(f"[ClusterWorker] Checking dependencies: {reason or 'verifying packages'}...")
+
+    # Step A: Uninstall incompatible PyTorch if needed
+    if need_uninstall:
+        print(f"[ClusterWorker] Mismatch detected: {reason}")
+        print("[ClusterWorker] Uninstalling existing PyTorch modules (torch, torchvision, torchaudio)...")
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "uninstall",
+                "torch", "torchvision", "torchaudio", "-y",
+            ])
+            print("[ClusterWorker] Old PyTorch packages uninstalled cleanly.")
+        except Exception as exc:
+            print(f"[ClusterWorker] Warning during pip uninstall: {exc}")
+
+    # Step B: Install target PyTorch packages
+    if need_install or missing_numpy:
+        # Check offline wheel cache in shared directory first
         shared_dir_env = os.environ.get("LLM_SHARED_PATH") or os.environ.get("LLM_SHARED_DIR", "")
         shared_wheels = Path(shared_dir_env) / "wheels" if shared_dir_env else None
         installed_offline = False
@@ -141,33 +462,38 @@ def ensure_dependencies() -> None:
                     cmd = [
                         sys.executable, "-m", "pip", "install",
                         "--no-index", f"--find-links={shared_wheels}",
-                        "torch", "numpy",
+                        "torch", "torchvision", "torchaudio",
                     ]
+                    if missing_numpy:
+                        cmd.append("numpy")
                     subprocess.check_call(cmd)
                     installed_offline = True
                     print("[ClusterWorker] Offline dependencies installed successfully from shared storage.")
                 except Exception as exc:
-                    print(f"[ClusterWorker] Note: offline wheel install failed ({exc}), falling back to online install...")
+                    print(f"[ClusterWorker] Offline wheel install failed ({exc}), falling back to online install...")
 
-        # 2. Online install fallback if offline was not used or failed
         if not installed_offline:
             try:
-                if need_cuda_torch:
-                    print("[ClusterWorker] NVIDIA GPU detected. Installing official PyTorch CUDA 12.4 wheel...")
+                if target_cuda:
+                    index_url = f"https://download.pytorch.org/whl/{target_cuda}"
+                    print(f"[ClusterWorker] Installing official PyTorch for {target_gpu_name} ({target_cuda}) from {index_url}...")
                     cmd = [
                         sys.executable, "-m", "pip", "install",
-                        "torch==2.6.0+cu124", "torchvision==0.21.0+cu124", "torchaudio==2.6.0+cu124",
-                        "--index-url", "https://download.pytorch.org/whl/cu124",
+                        "torch", "torchvision", "torchaudio",
+                        "--index-url", index_url,
                     ]
-                    if "numpy" in missing:
+                    if missing_numpy:
                         cmd.append("numpy")
                     subprocess.check_call(cmd)
-                elif missing:
-                    cmd = [sys.executable, "-m", "pip", "install", *missing]
+                else:
+                    print("[ClusterWorker] Installing standard PyTorch...")
+                    cmd = [sys.executable, "-m", "pip", "install", "torch", "torchvision", "torchaudio"]
+                    if missing_numpy:
+                        cmd.append("numpy")
                     subprocess.check_call(cmd)
-                print("[ClusterWorker] Dependencies verified successfully.")
+                print("[ClusterWorker] PyTorch dependencies installed and verified successfully.")
             except Exception as exc:
-                print(f"[ClusterWorker] Note: automatic dependency installation failed: {exc}")
+                print(f"[ClusterWorker] Error installing dependencies: {exc}")
 
 
 ensure_dependencies()
