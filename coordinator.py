@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import torch
@@ -72,6 +74,8 @@ class ClusterCoordinator:
         self.job_id = job_id
         self._cumulative_tokens: int = 0
         self._dataset_tokens: Optional[int] = None
+        self._best_val_loss: Optional[float] = None
+        self._best_checkpoint_path: Optional[str] = None
 
     def wait_and_average_round(
         self,
@@ -174,6 +178,13 @@ class ClusterCoordinator:
         self.bus.save_global_weights(self.job_id, round_num, global_state)
         agg_sec = max(time.time() - t_agg_start, 0.0)
 
+        # 1. Immediately delete worker weights to reclaim storage space
+        if hasattr(self.bus, "purge_round_worker_weights"):
+            self.bus.purge_round_worker_weights(self.job_id, round_num)
+        # 2. Prune old round directories older than the rolling window (keep 2)
+        if hasattr(self.bus, "purge_stale_rounds"):
+            self.bus.purge_stale_rounds(self.job_id, keep_last_rounds=2)
+
         # Aggregate telemetry across ready workers
         losses = [float(t["avg_loss"]) for t in worker_telemetries.values() if "avg_loss" in t]
         val_losses = [float(t["val_loss"]) for t in worker_telemetries.values() if t.get("val_loss") is not None]
@@ -194,65 +205,52 @@ class ClusterCoordinator:
         max_rounds = int(job.get("max_rounds") or 10)
         effective_step = (round_num + 1) * sync_interval
 
-        # Save durable checkpoint to shared storage (checkpoints/checkpoint_step_XXXXXX.pt & latest_checkpoint.pt)
-        is_final_round = (round_num + 1 >= max_rounds)
-        self.bus.save_checkpoint(self.job_id, effective_step, global_state, is_final=is_final_round)
-
-        if is_final_round:
-            ckpt_dir = self.bus.get_checkpoints_dir(self.job_id)
-            peft_m = str(job.get("peft_method") or "none").lower()
-            if peft_m == "lora":
-                adapters = {k: v for k, v in global_state.items() if ".lora_a" in k or ".lora_b" in k}
-                if adapters:
-                    adapter_target = ckpt_dir / "adapter_model.pt"
-                    torch.save({"adapter_state_dict": adapters, "lora_config": job.get("lora_config")}, adapter_target)
+        # Track validation loss and save best validation checkpoint
+        ckpt_dir = self.bus.get_checkpoints_dir(self.job_id)
+        if global_val_loss is not None:
+            if self._best_val_loss is None or global_val_loss < self._best_val_loss:
+                self._best_val_loss = global_val_loss
+                best_path = ckpt_dir / "checkpoint_best_val.pt"
+                best_alias = ckpt_dir / "best_checkpoint.pt"
+                self.bus.save_checkpoint(
+                    self.job_id,
+                    effective_step,
+                    global_state,
+                    is_final=False,
+                    round_num=round_num,
+                    train_loss=global_avg_loss,
+                    val_loss=global_val_loss,
+                )
                 try:
-                    m_cfg = job.get("model_config", {})
-                    if isinstance(m_cfg, str):
-                        m_cfg = json.loads(m_cfg)
-                    from cluster.worker import build_model_from_config, apply_lora_adapters, merged_lora_state_dict
-                    m_temp = build_model_from_config(m_cfg, "cpu")
-                    l_cfg = job.get("lora_config") or {}
-                    if isinstance(l_cfg, str):
-                        l_cfg = json.loads(l_cfg)
-                    apply_lora_adapters(
-                        m_temp,
-                        rank=int(l_cfg.get("rank", 8)),
-                        alpha=float(l_cfg.get("alpha", 16.0)),
-                        dropout=float(l_cfg.get("dropout", 0.0)),
-                        target_modules=str(l_cfg.get("target_modules", "attention")),
-                    )
-                    m_temp.load_state_dict(global_state, strict=False)
-                    merged = merged_lora_state_dict(m_temp)
-                    torch.save({"model_state_dict": merged, "model_config": m_cfg}, ckpt_dir / "final_model_merged.pt")
+                    latest_p = ckpt_dir / "latest_checkpoint.pt"
+                    if latest_p.exists():
+                        shutil.copyfile(latest_p, best_path)
+                        shutil.copyfile(latest_p, best_alias)
                 except Exception:
                     pass
+                self._best_checkpoint_path = str(best_path)
 
-            try:
-                tcfg_raw = job.get("training_config", {})
-                tcfg_dict = json.loads(tcfg_raw) if isinstance(tcfg_raw, str) else dict(tcfg_raw or {})
-                summary_data = {
-                    "job_id": self.job_id,
-                    "job_type": job.get("job_type", "pretrain"),
-                    "completed_at": time.time(),
-                    "total_rounds": round_num + 1,
-                    "final_loss": round(global_avg_loss, 4),
-                    "final_val_loss": global_val_loss,
-                    "model_config": job.get("model_config"),
-                    "training_config": tcfg_dict,
-                    "peft_method": peft_m,
-                    "lora_config": job.get("lora_config"),
-                    "base_checkpoint_path": job.get("base_checkpoint_path"),
-                }
-                (ckpt_dir / "training_summary.json").write_text(json.dumps(summary_data, indent=2, default=str), encoding="utf-8")
-                lineage_data = {
-                    "base_checkpoint": job.get("base_checkpoint_path"),
-                    "training_mode": job.get("job_type", "pretrain"),
-                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                }
-                (ckpt_dir / "model_lineage.json").write_text(json.dumps(lineage_data, indent=2, default=str), encoding="utf-8")
-            except Exception as exc:
-                print(f"[Coordinator summary export failed]: {exc}")
+        # Save durable checkpoint to shared storage (checkpoints/checkpoint_step_XXXXXX.pt & latest_checkpoint.pt)
+        is_final_round = (round_num + 1 >= max_rounds)
+        self.bus.save_checkpoint(
+            self.job_id,
+            effective_step,
+            global_state,
+            is_final=is_final_round,
+            round_num=round_num,
+            train_loss=global_avg_loss,
+            val_loss=global_val_loss,
+        )
+
+        if is_final_round:
+            self.finalize_job_artifacts(
+                global_state,
+                round_num,
+                is_final=True,
+                stopped=False,
+                global_avg_loss=global_avg_loss,
+                global_val_loss=global_val_loss,
+            )
 
         # Determine total dataset tokens if not yet cached
         if self._dataset_tokens is None:
@@ -322,7 +320,137 @@ class ClusterCoordinator:
     # Alias for convenience
     wait_for_round_and_aggregate = wait_and_average_round
 
-    def run_job(
+    def finalize_job_artifacts(
+        self,
+        global_state: dict[str, torch.Tensor],
+        round_num: int,
+        is_final: bool = True,
+        stopped: bool = False,
+        global_avg_loss: float = 0.0,
+        global_val_loss: Optional[float] = None,
+    ) -> None:
+        """Finalize job artifacts, export chat-loadable models and summaries, and ensure tokenizer availability."""
+        job = self.bus.get_job(self.job_id) or {}
+        ckpt_dir = self.bus.get_checkpoints_dir(self.job_id)
+        job_dir = self.bus.jobs_dir / self.job_id
+        peft_m = str(job.get("peft_method") or "none").lower()
+        sync_interval = int(job.get("sync_interval_steps") or 250)
+        effective_step = (round_num + 1) * sync_interval
+
+        # Ensure tokenizer.json is copied to job and checkpoint dirs
+        tok_src = None
+        base_path = job.get("base_checkpoint_path")
+        if base_path and os.path.exists(base_path):
+            c_tok = Path(base_path).parent / "tokenizer.json"
+            if c_tok.exists():
+                tok_src = c_tok
+        if not tok_src:
+            ds_p = job.get("dataset_path")
+            if ds_p:
+                p = Path(ds_p)
+                c_tok = p.parent / "tokenizer.json" if p.is_file() else p / "tokenizer.json"
+                if c_tok.exists():
+                    tok_src = c_tok
+                elif (self.bus.shared_dir / "tokenizer.json").exists():
+                    tok_src = self.bus.shared_dir / "tokenizer.json"
+        if tok_src and tok_src.exists():
+            for dst in (job_dir / "tokenizer.json", ckpt_dir / "tokenizer.json"):
+                try:
+                    if not dst.exists() or dst.stat().st_size != tok_src.stat().st_size:
+                        shutil.copyfile(tok_src, dst)
+                except Exception:
+                    pass
+
+        # Handle LoRA fine-tuning vs standard pretraining
+        if peft_m == "lora":
+            adapters = {k: v for k, v in global_state.items() if ".lora_a" in k or ".lora_b" in k}
+            if adapters:
+                for a_name in ("adapter_model.pt", "final_adapter.pt"):
+                    torch.save({"adapter_state_dict": adapters, "lora_config": job.get("lora_config")}, ckpt_dir / a_name)
+                    try:
+                        shutil.copyfile(ckpt_dir / a_name, job_dir / a_name)
+                    except Exception:
+                        pass
+            try:
+                m_cfg = job.get("model_config", {})
+                if isinstance(m_cfg, str):
+                    m_cfg = json.loads(m_cfg)
+                from cluster.worker import build_model_from_config, apply_lora_adapters, merged_lora_state_dict
+                m_temp = build_model_from_config(m_cfg, "cpu")
+                l_cfg = job.get("lora_config") or {}
+                if isinstance(l_cfg, str):
+                    l_cfg = json.loads(l_cfg)
+                apply_lora_adapters(
+                    m_temp,
+                    rank=int(l_cfg.get("rank", 8)),
+                    alpha=float(l_cfg.get("alpha", 16.0)),
+                    dropout=float(l_cfg.get("dropout", 0.0)),
+                    target_modules=str(l_cfg.get("target_modules", "attention")),
+                )
+                m_temp.load_state_dict(global_state, strict=False)
+                merged = merged_lora_state_dict(m_temp)
+
+                merged_payload = {
+                    "artifact_type": "inference",
+                    "model_config": m_cfg,
+                    "model_state_dict": merged,
+                    "global_step": effective_step,
+                    "round": round_num,
+                    "train_loss": global_avg_loss,
+                    "val_loss": global_val_loss,
+                }
+                # Save both final_model_merged.pt and final_model.pt so Chat & Export can load directly
+                for m_target in (ckpt_dir / "final_model_merged.pt", ckpt_dir / "final_model.pt", job_dir / "final_model.pt", ckpt_dir / "model.pt", job_dir / "model.pt"):
+                    torch.save(merged_payload, m_target)
+            except Exception as exc:
+                print(f"[Coordinator LoRA merge notice]: {exc}")
+        else:
+            # Full pre-training or standard fine-tuning
+            self.bus.save_checkpoint(
+                self.job_id,
+                effective_step,
+                global_state,
+                is_final=True,
+                round_num=round_num,
+                train_loss=global_avg_loss,
+                val_loss=global_val_loss,
+            )
+
+        try:
+            tcfg_raw = job.get("training_config", {})
+            tcfg_dict = json.loads(tcfg_raw) if isinstance(tcfg_raw, str) else dict(tcfg_raw or {})
+            summary_data = {
+                "job_id": self.job_id,
+                "job_type": job.get("job_type", "pretrain"),
+                "completed_at": time.time(),
+                "stopped": stopped,
+                "total_rounds": round_num + 1,
+                "final_loss": round(global_avg_loss, 4),
+                "final_val_loss": global_val_loss,
+                "best_val_loss": self._best_val_loss,
+                "best_checkpoint_path": self._best_checkpoint_path,
+                "recommended_checkpoint_path": self._best_checkpoint_path or str(ckpt_dir / "final_model.pt"),
+                "model_config": job.get("model_config"),
+                "training_config": tcfg_dict,
+                "peft_method": peft_m,
+                "lora_config": job.get("lora_config"),
+                "base_checkpoint_path": job.get("base_checkpoint_path"),
+            }
+            summary_text = json.dumps(summary_data, indent=2, default=str)
+            (ckpt_dir / "training_summary.json").write_text(summary_text, encoding="utf-8")
+            (job_dir / "training_summary.json").write_text(summary_text, encoding="utf-8")
+            lineage_data = {
+                "base_checkpoint": job.get("base_checkpoint_path"),
+                "training_mode": job.get("job_type", "pretrain"),
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            }
+            lineage_text = json.dumps(lineage_data, indent=2, default=str)
+            (ckpt_dir / "model_lineage.json").write_text(lineage_text, encoding="utf-8")
+            (job_dir / "model_lineage.json").write_text(lineage_text, encoding="utf-8")
+        except Exception as exc:
+            print(f"[Coordinator summary export notice]: {exc}")
+
+    def run_all_rounds(
         self,
         poll_interval_seconds: float = 2.0,
         telemetry_callback: Optional[Callable[[dict[str, Any]], None]] = None,
@@ -344,6 +472,8 @@ class ClusterCoordinator:
 
         max_rounds = int(job.get("max_rounds") or 10)
         cur_round = int(job.get("current_round") or 0)
+        last_state = None
+        last_round = cur_round
 
         while cur_round < max_rounds:
             if stop_event and stop_event.is_set():
@@ -352,8 +482,10 @@ class ClusterCoordinator:
                 break
             while self.bus.is_paused(self.job_id):
                 if stop_event and stop_event.is_set() or self.bus.is_stopped(self.job_id):
-                    return False
+                    break
                 time.sleep(poll_interval_seconds)
+            if stop_event and stop_event.is_set() or self.bus.is_stopped(self.job_id):
+                break
 
             state = self.wait_and_average_round(
                 round_num=cur_round,
@@ -361,13 +493,36 @@ class ClusterCoordinator:
                 progress_callback=telemetry_callback,
             )
             if state is None:
-                return False
+                break
+            last_state = state
+            last_round = cur_round
             cur_round += 1
 
-        if cur_round >= max_rounds:
+        is_completed = (cur_round >= max_rounds)
+        if last_state is not None:
+            self.finalize_job_artifacts(
+                last_state,
+                last_round,
+                is_final=is_completed,
+                stopped=not is_completed,
+            )
+        elif not is_completed:
+            latest_weights = self.bus.load_latest_checkpoint(self.job_id)
+            if latest_weights:
+                self.finalize_job_artifacts(
+                    latest_weights,
+                    max(cur_round - 1, 0),
+                    is_final=False,
+                    stopped=True,
+                )
+
+        if is_completed:
             self.bus.set_job_status(self.job_id, "COMPLETED")
             return True
         return False
+
+    # Alias
+    run_job = run_all_rounds
 
 
 def main(argv: Optional[list[str]] = None) -> int:

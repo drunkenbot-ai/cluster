@@ -548,9 +548,9 @@ class ClusterStorageBus:
                 if not staged_base.exists() or staged_base.stat().st_size != Path(base_checkpoint_path).stat().st_size:
                     shutil.copyfile(base_checkpoint_path, staged_base)
                 staged_base_path = str(staged_base)
-                # Copy tokenizer and lineage metadata alongside base model if present
+                # Copy lineage metadata alongside base model if present
                 base_dir = Path(base_checkpoint_path).parent
-                for meta_name in ("tokenizer.json", "model_lineage.json", "training_summary.json"):
+                for meta_name in ("model_lineage.json", "training_summary.json"):
                     src_m = base_dir / meta_name
                     dst_m = job_dir / meta_name
                     if src_m.exists() and (not dst_m.exists() or dst_m.stat().st_size != src_m.stat().st_size):
@@ -560,6 +560,29 @@ class ClusterStorageBus:
                             pass
             except Exception:
                 pass
+
+        # Guarantee tokenizer.json is copied to job_dir and checkpoints/ for both pretrain and fine_tune
+        ckpt_dir = self.get_checkpoints_dir(job_id)
+        tok_src = None
+        if base_checkpoint_path and os.path.exists(base_checkpoint_path):
+            cand_tok = Path(base_checkpoint_path).parent / "tokenizer.json"
+            if cand_tok.exists():
+                tok_src = cand_tok
+        if not tok_src and dataset_path:
+            ds_p = Path(dataset_path)
+            cand_tok = ds_p.parent / "tokenizer.json" if ds_p.is_file() else ds_p / "tokenizer.json"
+            if cand_tok.exists():
+                tok_src = cand_tok
+            elif (self.shared_dir / "tokenizer.json").exists():
+                tok_src = self.shared_dir / "tokenizer.json"
+
+        if tok_src and tok_src.exists():
+            for dst_t in (job_dir / "tokenizer.json", ckpt_dir / "tokenizer.json"):
+                try:
+                    if not dst_t.exists() or dst_t.stat().st_size != tok_src.stat().st_size:
+                        shutil.copyfile(tok_src, dst_t)
+                except Exception:
+                    pass
 
         def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
@@ -1156,31 +1179,144 @@ class ClusterStorageBus:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         return ckpt_dir
 
+    def purge_round_worker_weights(self, job_id: str, round_num: int) -> int:
+        """Immediately delete deposited worker weight files for a completed round.
+
+        Once the coordinator has averaged worker weights into global_model.pt,
+        individual worker .pt files are obsolete and should be purged immediately
+        to prevent consuming gigabytes/terabytes of storage.
+        """
+        round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"
+        if not round_dir.exists():
+            return 0
+        purged = 0
+        for f in round_dir.glob("*.pt"):
+            if f.name != "global_model.pt":
+                try:
+                    f.unlink(missing_ok=True)
+                    purged += 1
+                except Exception:
+                    pass
+        for f in round_dir.glob("*.pt.tmp"):
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for f in round_dir.glob("*.ready"):
+            if f.name != "global_model.ready":
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        return purged
+
+    def purge_stale_rounds(self, job_id: str, keep_last_rounds: int = 2) -> int:
+        """Remove historical round folders older than the active rolling window."""
+        rounds_dir = self.jobs_dir / job_id / "rounds"
+        if not rounds_dir.exists():
+            return 0
+        round_dirs = sorted([d for d in rounds_dir.glob("round_*") if d.is_dir()])
+        if len(round_dirs) <= keep_last_rounds:
+            return 0
+        purged = 0
+        for old_dir in round_dirs[:-keep_last_rounds]:
+            try:
+                shutil.rmtree(old_dir, ignore_errors=True)
+                purged += 1
+            except Exception:
+                pass
+        return purged
+
     def save_checkpoint(
         self,
         job_id: str,
         step: int,
         state_dict: dict[str, torch.Tensor],
         is_final: bool = False,
+        model_config: Optional[dict[str, Any]] = None,
+        training_config: Optional[dict[str, Any]] = None,
+        round_num: Optional[int] = None,
+        train_loss: Optional[float] = None,
+        val_loss: Optional[float] = None,
+        peft_method: str = "none",
+        lora_config: Optional[dict[str, Any]] = None,
+        adapter_state_dict: Optional[dict[str, torch.Tensor]] = None,
+        max_keep: int = 2,
     ) -> Path:
-        """Save a durable checkpoint on central shared storage."""
+        """Save a durable, chat-ready checkpoint on central shared storage."""
         ckpt_dir = self.get_checkpoints_dir(job_id)
+        job_dir = self.jobs_dir / job_id
+
+        # Resolve model_config and training_config from database if not supplied
+        if model_config is None or training_config is None:
+            job = self.get_job(job_id)
+            if job:
+                if model_config is None:
+                    model_config = job.get("model_config") or {}
+                if training_config is None:
+                    training_config = job.get("training_config") or {}
+                if lora_config is None:
+                    lora_config = job.get("lora_config")
+                if peft_method == "none":
+                    peft_method = str(job.get("peft_method") or "none").lower()
+
+        payload: dict[str, Any] = {
+            "artifact_type": "inference" if is_final else "resume",
+            "model_config": model_config or {},
+            "training_config": training_config or {},
+            "global_step": step,
+            "round": round_num if round_num is not None else 0,
+            "train_loss": train_loss if train_loss is not None else 0.0,
+            "val_loss": val_loss,
+            "model_state_dict": {
+                k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in state_dict.items()
+            },
+        }
+        if peft_method == "lora":
+            payload["peft_method"] = "lora"
+            if lora_config:
+                payload["lora_config"] = lora_config
+            if adapter_state_dict:
+                payload["adapter_state_dict"] = {
+                    k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+                    for k, v in adapter_state_dict.items()
+                }
+
         target = ckpt_dir / f"checkpoint_step_{step:06d}.pt"
         tmp_target = ckpt_dir / f"checkpoint_step_{step:06d}.pt.tmp"
-        torch.save(state_dict, tmp_target)
+        torch.save(payload, tmp_target)
         tmp_target.replace(target)
 
         # Update latest_checkpoint.pt
         latest_target = ckpt_dir / "latest_checkpoint.pt"
         latest_tmp = ckpt_dir / "latest_checkpoint.pt.tmp"
-        torch.save(state_dict, latest_tmp)
+        torch.save(payload, latest_tmp)
         latest_tmp.replace(latest_target)
 
         if is_final:
             final_target = ckpt_dir / "final_model.pt"
             final_tmp = ckpt_dir / "final_model.pt.tmp"
-            torch.save(state_dict, final_tmp)
+            torch.save(payload, final_tmp)
             final_tmp.replace(final_target)
+
+            # Also provide aliases for convenience and backward compatibility
+            for alias_name, alias_dir in (("final_model.pt", job_dir), ("model.pt", ckpt_dir), ("model.pt", job_dir)):
+                try:
+                    alias_path = alias_dir / alias_name
+                    shutil.copyfile(final_target, alias_path)
+                except Exception:
+                    pass
+
+        # Prune older step checkpoints if requested
+        if max_keep > 0:
+            step_files = sorted(ckpt_dir.glob("checkpoint_step_*.pt"))
+            if len(step_files) > max_keep:
+                for old_f in step_files[:-max_keep]:
+                    try:
+                        old_f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         return target
 
@@ -1193,10 +1329,16 @@ class ClusterStorageBus:
         ckpt_dir = self.get_checkpoints_dir(job_id)
         latest = ckpt_dir / "latest_checkpoint.pt"
         if latest.exists():
-            return safe_torch_load(latest, device=device)
+            obj = safe_torch_load(latest, device=device)
+            if isinstance(obj, dict) and "model_state_dict" in obj:
+                return obj["model_state_dict"]
+            return obj
         final = ckpt_dir / "final_model.pt"
         if final.exists():
-            return safe_torch_load(final, device=device)
+            obj = safe_torch_load(final, device=device)
+            if isinstance(obj, dict) and "model_state_dict" in obj:
+                return obj["model_state_dict"]
+            return obj
         return None
 
     # -------------------------------------------------------------------------
