@@ -680,6 +680,11 @@ class ClusterStorageBus:
             res = dict(row)
             res["model_config"] = json.loads(res["model_config"])
             res["training_config"] = json.loads(res["training_config"])
+            if res.get("lora_config") and isinstance(res["lora_config"], str):
+                try:
+                    res["lora_config"] = json.loads(res["lora_config"])
+                except Exception:
+                    pass
             return res
         return self._run_with_retry(_op, default_on_error=None, silent=True)
 

@@ -893,7 +893,23 @@ def cache_dataset_to_local(
             log(f"[DatasetCache] Chunked stream encountered {os_err}, attempting fallback via shutil.copyfile...", level="WARNING")
             shutil.copyfile(str(remote_file), str(temp_file))
 
-        temp_file.replace(local_file)
+        if local_file.exists():
+            try:
+                if local_file.stat().st_size == remote_size:
+                    if temp_file.exists():
+                        temp_file.unlink(missing_ok=True)
+                    return str(local_file)
+                local_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            temp_file.replace(local_file)
+        except PermissionError:
+            if local_file.exists() and local_file.stat().st_size == remote_size:
+                if temp_file.exists():
+                    temp_file.unlink(missing_ok=True)
+                return str(local_file)
+            raise
         try:
             os.utime(str(local_file), (remote_mtime, remote_mtime))
         except Exception:
@@ -2494,6 +2510,13 @@ class StandaloneWorker:
             peft_method = str(job.get("peft_method") or training_cfg.get("peft_method") or "none").lower()
             if peft_method == "lora":
                 lora_cfg = job.get("lora_config") or training_cfg.get("lora_config") or {}
+                if isinstance(lora_cfg, str):
+                    try:
+                        lora_cfg = json.loads(lora_cfg)
+                    except Exception:
+                        lora_cfg = {}
+                if not isinstance(lora_cfg, dict):
+                    lora_cfg = {}
                 l_rank = int(lora_cfg.get("rank", training_cfg.get("lora_rank", 8)))
                 l_alpha = float(lora_cfg.get("alpha", training_cfg.get("lora_alpha", 16.0)))
                 l_dropout = float(lora_cfg.get("dropout", training_cfg.get("lora_dropout", 0.05)))
