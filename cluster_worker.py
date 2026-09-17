@@ -1935,6 +1935,10 @@ class StandaloneMicroGPT(nn.Module):
         self.ln_f = make_standalone_norm(norm_type, d_model, bias=bias)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
         self.token_embedding.weight = self.lm_head.weight
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         b, t = idx.size()
@@ -1948,21 +1952,30 @@ class StandaloneMicroGPT(nn.Module):
             positions = torch.arange(0, t, dtype=torch.long, device=idx.device)
             x = x + self.position_embedding(positions)
         x = self.drop(x)
-        x = self.blocks(x)
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         x = self.ln_f(x)
         return self.lm_head(x)
 
 
 def build_worker_model(model_config: dict[str, Any], device: str) -> nn.Module:
     """Build model using engine if available, or standalone exact MicroGPT implementation."""
+    ctx_len = int(model_config.get("context_length", 0) or 0)
     try:
         from engine.config import ModelConfig
         from engine.model import MicroGPT
         valid_keys = ModelConfig.__dataclass_fields__.keys()
         filtered = {k: v for k, v in model_config.items() if k in valid_keys}
-        return MicroGPT(ModelConfig(**filtered)).to(device)
+        m = MicroGPT(ModelConfig(**filtered)).to(device)
     except Exception:
-        return StandaloneMicroGPT(model_config).to(device)
+        m = StandaloneMicroGPT(model_config).to(device)
+
+    if hasattr(m, "enable_gradient_checkpointing") and ctx_len >= 1024:
+        m.enable_gradient_checkpointing(True)
+    return m
 
 
 # -----------------------------------------------------------------------------
@@ -2561,6 +2574,16 @@ class StandaloneWorker:
             trainable_params = [p for p in model.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(trainable_params, lr=lr)
             self.log(f"Initialized model for {self.worker_id} on {self.device_str} ({len(trainable_params)} trainable tensor(s)). Ready to train.")
+
+            # Ensure activation checkpointing is active for long contexts or when configured
+            act_ckpt = bool(training_cfg.get("activation_checkpointing", False) or context_length >= 1024)
+            if hasattr(model, "enable_gradient_checkpointing"):
+                model.enable_gradient_checkpointing(act_ckpt)
+                self.log(f"Activation checkpointing {'ENABLED' if act_ckpt else 'disabled'} (context_length={context_length}).")
+
+            if self.device_str.startswith("cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             self._heartbeat(status="READY", current_job_id=job_id)
         except Exception as exc:
             import traceback
@@ -2642,6 +2665,24 @@ class StandaloneWorker:
                 model.train()
                 self._heartbeat(status="TRAINING", current_job_id=job_id)
 
+                grad_accum = max(1, int(training_cfg.get("gradient_accumulation", 1) or 1))
+                if is_cuda:
+                    try:
+                        dev_idx = 0
+                        if ":" in self.device_str:
+                            dev_idx = int(self.device_str.split(":")[1])
+                        _, tot_bytes = torch.cuda.mem_get_info(dev_idx)
+                        tot_gb = tot_bytes / (1024 ** 3)
+                    except Exception:
+                        tot_gb = 16.0
+                    max_safe_tokens = 4096 if tot_gb <= 12.0 else 8192
+                    safe_micro_bs = max(1, max_safe_tokens // max(context_length, 1)) if context_length > 0 else 4
+                else:
+                    safe_micro_bs = 999999
+
+                optimizer.zero_grad(set_to_none=True)
+                accumulated_batches = 0
+
                 start_time = time.time()
                 tokens_processed = 0
                 step_losses = []
@@ -2675,32 +2716,50 @@ class StandaloneWorker:
                         batch = next(dataloader_iter)
 
                     x, y = batch
+                    batch_sz = x.size(0)
                     tokens_processed += int(x.numel())
                     x = torch.clamp(x, 0, vocab_size - 1)
                     y = torch.clamp(y, 0, vocab_size - 1)
-                    x = x.to(self.device_str, non_blocking=True)
-                    y = y.to(self.device_str, non_blocking=True)
 
-                    optimizer.zero_grad()
-                    with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                        logits = model(x)
-                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                    micro_bs = max(1, min(batch_sz, safe_micro_bs))
+                    num_micros = math.ceil(batch_sz / micro_bs)
+                    effective_accum = num_micros * grad_accum
+
+                    batch_loss = 0.0
+                    for m_idx in range(0, batch_sz, micro_bs):
+                        x_m = x[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
+                        y_m = y[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
+
+                        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                            logits = model(x_m)
+                            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_m.view(-1))
+                            scaled_loss = loss / effective_accum
+
+                        if scaler is not None:
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+
+                        batch_loss += float(loss.item()) * (x_m.size(0) / batch_sz)
+
+                    accumulated_batches += 1
+                    is_step_boundary = (accumulated_batches % grad_accum == 0) or (step_idx + 1 == sync_steps)
 
                     max_grad = float(training_cfg.get("max_gradient") or training_cfg.get("max_grad") or 1.0)
-                    if scaler is not None:
-                        scaler.scale(loss).backward()
-                        if max_grad > 0:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        loss.backward()
-                        if max_grad > 0:
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
-                        optimizer.step()
+                    if is_step_boundary:
+                        if scaler is not None:
+                            if max_grad > 0:
+                                scaler.unscale_(optimizer)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            if max_grad > 0:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-                    step_losses.append(float(loss.item()))
+                    step_losses.append(batch_loss)
 
                 elapsed = max(time.time() - start_time, 1e-4)
                 tokens_per_sec = tokens_processed / elapsed

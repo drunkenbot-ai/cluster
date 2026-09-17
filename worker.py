@@ -11,6 +11,7 @@ Runs as a lightweight headless service on worker compute nodes:
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -490,6 +491,9 @@ def build_model_from_config(
         log(f"Instantiating MicroGPT on CPU (layers={cfg.layer_count}, heads={cfg.head_count}, embd={cfg.embedding_size}, vocab={cfg.vocab_size})...")
         t0 = time.time()
         model = MicroGPT(cfg)
+        if hasattr(model, "enable_gradient_checkpointing") and getattr(cfg, "context_length", 0) >= 1024:
+            model.enable_gradient_checkpointing(True)
+            log(f"Activation checkpointing enabled for context length {cfg.context_length}.")
         log(f"MicroGPT constructed on CPU in {time.time() - t0:.2f}s. Transferring parameters to {device}...")
         t1 = time.time()
         model = model.to(device)
@@ -1031,6 +1035,38 @@ class ClusterWorker:
                 self._scaler = torch.amp.GradScaler('cuda')
             scaler = self._scaler
 
+        # Activation checkpointing guard: automatically enable for long contexts or when configured
+        ctx_len = 0
+        if hasattr(model, "config") and hasattr(model.config, "context_length"):
+            ctx_len = int(model.config.context_length)
+        elif isinstance(job, dict):
+            ctx_len = int(job.get("model_config", {}).get("context_length", 0) or 0)
+        should_checkpoint = bool(training_cfg.get("activation_checkpointing", False) or ctx_len >= 1024)
+        if hasattr(model, "enable_gradient_checkpointing"):
+            model.enable_gradient_checkpointing(should_checkpoint)
+
+        # Gradient accumulation configuration
+        grad_accum = max(1, int(training_cfg.get("gradient_accumulation", 1) or 1))
+        max_grad = float(training_cfg.get("max_gradient") or training_cfg.get("max_grad") or 1.0)
+
+        # Compute safe micro-batch size for GPU execution to prevent VRAM overflow
+        if is_cuda:
+            try:
+                dev_idx = 0
+                if ":" in self.device_str:
+                    dev_idx = int(self.device_str.split(":")[1])
+                _, tot_bytes = torch.cuda.mem_get_info(dev_idx)
+                tot_gb = tot_bytes / (1024 ** 3)
+            except Exception:
+                tot_gb = 16.0
+            max_safe_tokens = 4096 if tot_gb <= 12.0 else 8192
+            safe_micro_bs = max(1, max_safe_tokens // max(ctx_len, 1)) if ctx_len > 0 else 4
+        else:
+            safe_micro_bs = 999999
+
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_batches = 0
+
         for step in range(steps_per_round):
             if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
                 break
@@ -1052,35 +1088,51 @@ class ClusterWorker:
                 batch = next(dataloader_iter)
 
             x, y = batch
+            batch_sz = x.size(0)
             tokens_processed += int(x.numel())
             if hasattr(model, "token_embedding") and hasattr(model.token_embedding, "num_embeddings"):
                 n_emb = model.token_embedding.num_embeddings
                 x = torch.clamp(x, 0, n_emb - 1)
                 y = torch.clamp(y, 0, n_emb - 1)
-            x = x.to(self.device_str, non_blocking=True)
-            y = y.to(self.device_str, non_blocking=True)
 
-            optimizer.zero_grad()
-            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            micro_bs = max(1, min(batch_sz, safe_micro_bs))
+            num_micros = math.ceil(batch_sz / micro_bs)
+            effective_accum = num_micros * grad_accum
 
-            max_grad = float(training_cfg.get("max_gradient") or training_cfg.get("max_grad") or 1.0)
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if max_grad > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                if max_grad > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
-                optimizer.step()
+            batch_loss = 0.0
+            for m_idx in range(0, batch_sz, micro_bs):
+                x_m = x[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
+                y_m = y[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
 
-            loss_val = float(loss.item())
-            total_loss += loss_val
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
+                    logits = model(x_m)
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_m.view(-1))
+                    scaled_loss = loss / effective_accum
+
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
+
+                batch_loss += float(loss.item()) * (x_m.size(0) / batch_sz)
+
+            accumulated_batches += 1
+            is_step_boundary = (accumulated_batches % grad_accum == 0) or (step + 1 == steps_per_round)
+
+            if is_step_boundary:
+                if scaler is not None:
+                    if max_grad > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if max_grad > 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            total_loss += batch_loss
             steps_done += 1
 
             # Evaluate empirical VRAM utilization after the first batch finishes
@@ -1094,7 +1146,7 @@ class ClusterWorker:
                     "round": round_num,
                     "step": step + 1,
                     "steps_per_round": steps_per_round,
-                    "loss": loss_val,
+                    "loss": batch_loss,
                 })
 
         elapsed = max(time.time() - start_time, 1e-4)
@@ -1328,6 +1380,15 @@ class ClusterWorker:
                 t_opt = time.time()
                 optimizer = torch.optim.AdamW(trainable_params, lr=lr)
                 self.log(f"Optimizer created in {time.time() - t_opt:.2f}s on '{self.device_str}'. Ready to train {max_rounds} rounds.")
+
+                # Ensure activation checkpointing is active for long contexts or when configured
+                act_ckpt = bool(training_config.get("activation_checkpointing", False) or context_length >= 1024)
+                if hasattr(model, "enable_gradient_checkpointing"):
+                    model.enable_gradient_checkpointing(act_ckpt)
+                    self.log(f"Activation checkpointing {'ENABLED' if act_ckpt else 'disabled'} (context_length={context_length}).")
+
+                if self.device_str.startswith("cuda") and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             except Exception as exc:
                 import traceback
                 tb = traceback.format_exc()
