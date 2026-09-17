@@ -344,23 +344,28 @@ def get_installed_torch_status() -> tuple[Optional[str], Optional[str], bool]:
     is_cuda_avail = False
     try:
         probe_code = (
+            "import warnings; warnings.filterwarnings('ignore'); "
             "import torch; "
             "print('CUDA_AVAIL=' + str(bool(torch.cuda.is_available())) + "
             "';CUDA_VER=' + str(getattr(torch.version, 'cuda', '') or ''))"
         )
         out = subprocess.check_output(
-            [sys.executable, "-c", probe_code],
+            [sys.executable, "-W", "ignore", "-c", probe_code],
             text=True,
             stderr=subprocess.DEVNULL,
-            timeout=10,
+            timeout=45,
         )
-        for part in out.strip().split(";"):
-            if part.startswith("CUDA_AVAIL="):
-                is_cuda_avail = part.split("=")[1].strip().lower() == "true"
-            elif part.startswith("CUDA_VER="):
-                sub_ver = part.split("=")[1].strip()
-                if sub_ver and not cuda_tag:
-                    cuda_tag = "cu" + sub_ver.replace(".", "")
+        if "CUDA_AVAIL=True" in out:
+            is_cuda_avail = True
+        elif "CUDA_AVAIL=False" in out:
+            is_cuda_avail = False
+        if "CUDA_VER=" in out:
+            for line in out.splitlines():
+                for part in line.split(";"):
+                    if part.startswith("CUDA_VER="):
+                        sub_ver = part.split("=")[1].strip()
+                        if sub_ver and not cuda_tag:
+                            cuda_tag = "cu" + sub_ver.replace(".", "")
     except Exception:
         pass
 
@@ -370,6 +375,8 @@ def get_installed_torch_status() -> tuple[Optional[str], Optional[str], bool]:
 def ensure_dependencies() -> None:
     """Ensure torch and numpy are installed with the exact CUDA wheel matching the host's GPU."""
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("LLM_TEST_BOOTSTRAP_EXECUTE"):
+        return
+    if os.environ.get("LLM_SKIP_BOOTSTRAP"):
         return
 
     # 1. Check for numpy
@@ -413,9 +420,14 @@ def ensure_dependencies() -> None:
             need_install = True
             reason = f"PyTorch is not installed (target: {target_cuda} for {target_gpu_name})"
         elif not is_cuda_avail:
-            need_uninstall = True
-            need_install = True
-            reason = f"Installed PyTorch ({installed_ver}) lacks working CUDA for {target_gpu_name} (needs {target_cuda})"
+            # If the wheel already matches target_cuda (e.g. cu128 for RTX 5060 Ti), do not repeatedly uninstall
+            if installed_cuda_tag and installed_cuda_tag == target_cuda:
+                need_uninstall = False
+                need_install = False
+            else:
+                need_uninstall = True
+                need_install = True
+                reason = f"Installed PyTorch ({installed_ver}) lacks working CUDA for {target_gpu_name} (needs {target_cuda})"
         elif is_rtx_detected and installed_cuda_tag != target_cuda:
             need_uninstall = True
             need_install = True
