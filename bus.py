@@ -364,12 +364,12 @@ class ClusterStorageBus:
         def _op(conn: sqlite3.Connection) -> None:
             conn.execute("""
                 INSERT INTO workers (worker_id, hostname, gpu_name, vram_gb, status, last_heartbeat, created_at)
-                VALUES (?, ?, ?, ?, 'IDLE', ?, ?)
+                VALUES (?, ?, ?, ?, 'INITIALIZING', ?, ?)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     hostname = excluded.hostname,
                     gpu_name = excluded.gpu_name,
                     vram_gb = excluded.vram_gb,
-                    status = 'IDLE',
+                    status = CASE WHEN status = 'RESTARTING' THEN 'INITIALIZING' ELSE status END,
                     last_heartbeat = excluded.last_heartbeat;
             """, (worker_id, hostname, gpu_name, vram_gb, now, now))
         self._run_with_retry(_op)
@@ -439,9 +439,11 @@ class ClusterStorageBus:
             data = dict(r)
             last_hb = float(data.get("last_heartbeat") or 0)
             time_diff = now - last_hb
-            # Allow bidirectional clock skew across networked workstations (up to active_within_seconds behind, or up to 5 min in future)
-            is_fresh = (time_diff < active_within_seconds) and (time_diff > -300.0)
             stored_status = str(data.get("status") or "OFFLINE").upper()
+            # Allow extended grace period (180s) for workers booting, restarting, or running hardware preflight
+            thresh = 180.0 if stored_status in {"STARTING", "INITIALIZING", "RESTARTING", "PREFLIGHT"} else active_within_seconds
+            # Allow bidirectional clock skew across networked workstations (up to thresh behind, or up to 5 min in future)
+            is_fresh = (time_diff < thresh) and (time_diff > -300.0)
             data["enabled"] = bool(data.get("enabled", 1)) if data.get("enabled") is not None else True
             if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
                 data["is_online"] = False

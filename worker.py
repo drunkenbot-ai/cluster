@@ -672,7 +672,7 @@ class ClusterWorker:
         self._child_worker_procs: list[tuple[subprocess.Popen, str]] = []
         self._stop_event = threading.Event()
         self._current_job_id: Optional[str] = None
-        self._current_status = "IDLE"
+        self._current_status = "INITIALIZING"
         self._last_round_metrics: dict[str, Any] = {}
         self._preflight_ok: bool = True
         self._incompatible_jobs_reported: set[str] = set()
@@ -693,6 +693,10 @@ class ClusterWorker:
             vram_gb=self.vram_gb,
         )
         self.bus.set_worker_command(self.worker_id, None)
+        try:
+            self.bus.heartbeat(self.worker_id, status="INITIALIZING", current_job_id=None)
+        except Exception:
+            pass
 
         # Start background heartbeat daemon thread
         self._hb_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
@@ -758,11 +762,25 @@ class ClusterWorker:
                 elif cmd == "RESTART":
                     self.log("Received remote RESTART command. Respawning worker process...")
                     self.bus.set_worker_command(self.worker_id, None)
+                    self._current_status = "RESTARTING"
+                    try:
+                        self.bus.heartbeat(self.worker_id, status="RESTARTING", current_job_id=None)
+                    except Exception:
+                        pass
                     self._cleanup_child_worker_procs()
                     from .cluster_worker import release_singleton_lock, get_device_tag, get_worker_respawn_cmd
                     if not self.allow_shared_device:
                         release_singleton_lock(get_device_tag(self.device_str))
                     release_singleton_lock(f"wid_{self.worker_id}")
+
+                    # Attempt git pull to grab latest repository updates if running inside a git checkout
+                    try:
+                        repo_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
+                        if (repo_dir / ".git").exists():
+                            self.log("Pulling latest cluster repository changes before respawning...")
+                            subprocess.run(["git", "pull", "--ff-only"], cwd=str(repo_dir), timeout=15, capture_output=True)
+                    except Exception:
+                        pass
 
                     cmd_args = get_worker_respawn_cmd(
                         worker_id=self.worker_id,
@@ -1812,6 +1830,11 @@ class ClusterWorker:
             self._lock_acquired = True
 
         # Run hardware and environment preflight verification
+        self._current_status = "PREFLIGHT"
+        try:
+            self.bus.heartbeat(self.worker_id, status="PREFLIGHT", current_job_id=None)
+        except Exception:
+            pass
         preflight_ok, report_lines = self.run_hardware_preflight()
         for line in report_lines:
             self.log(line)
@@ -1826,6 +1849,12 @@ class ClusterWorker:
             while not self._stop_event.is_set():
                 self._stop_event.wait(poll_interval)
             return
+
+        self._current_status = "IDLE"
+        try:
+            self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+        except Exception:
+            pass
 
         # Dedicated execution loop for ephemeral auxiliary worker processes
         if self.ephemeral_job_id:

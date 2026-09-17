@@ -1347,8 +1347,10 @@ class StandaloneStorageBus:
         for r in rows:
             data = dict(r)
             last_hb = float(data.get("last_heartbeat") or 0)
-            is_fresh = (now - last_hb) < active_within_seconds
+            time_diff = now - last_hb
             stored_status = str(data.get("status") or "OFFLINE").upper()
+            thresh = 180.0 if stored_status in {"STARTING", "INITIALIZING", "RESTARTING", "PREFLIGHT"} else active_within_seconds
+            is_fresh = (time_diff < thresh) and (time_diff > -300.0)
             data["enabled"] = bool(data.get("enabled", 1)) if data.get("enabled") is not None else True
             if not is_fresh or stored_status in {"OFFLINE", "STOPPED"}:
                 data["is_online"] = False
@@ -2182,6 +2184,10 @@ class StandaloneWorker:
         """Cleanly respawn this worker process and exit."""
         self.log(f"Respawning worker process for {self.worker_id}...")
         self.bus.set_worker_command(self.worker_id, None)
+        try:
+            self._heartbeat(status="RESTARTING", current_job_id=None)
+        except Exception:
+            pass
         if hasattr(self, "_cleanup_func"):
             import atexit
             try:
@@ -2190,6 +2196,15 @@ class StandaloneWorker:
                 pass
         release_singleton_lock(self.device_tag)
         release_singleton_lock(f"wid_{self.worker_id}")
+
+        # Attempt git pull to grab latest repository updates if running inside a git checkout
+        try:
+            root_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
+            if (root_dir / ".git").exists():
+                self.log("Pulling latest cluster repository changes before respawning...")
+                subprocess.run(["git", "pull", "--ff-only"], cwd=str(root_dir), timeout=15, capture_output=True)
+        except Exception:
+            pass
 
         cmd_args = get_worker_respawn_cmd(
             worker_id=self.worker_id,
