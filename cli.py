@@ -16,13 +16,10 @@ import sys
 import time
 from pathlib import Path
 
-from .bus import ClusterStorageBus
-from .worker import ClusterWorker
-
-
 def cmd_worker(args: argparse.Namespace) -> int:
     """Run a persistent headless worker daemon."""
     from .cluster_worker import (
+        ensure_dependencies,
         acquire_singleton_lock,
         get_device_tag,
         get_running_worker_pid,
@@ -30,7 +27,6 @@ def cmd_worker(args: argparse.Namespace) -> int:
         release_singleton_lock,
         stop_running_worker,
     )
-    from .worker import get_hardware_info
 
     if getattr(args, "stop", False):
         dev_tag = get_device_tag(args.device) if args.device else None
@@ -39,6 +35,12 @@ def cmd_worker(args: argparse.Namespace) -> int:
     if not args.shared_dir:
         print("[Worker] ERROR: --shared-dir is required to start a worker.")
         return 1
+
+    # Verify and auto-bootstrap PyTorch with CUDA matching host GPU BEFORE importing torch
+    ensure_dependencies()
+
+    from .bus import ClusterStorageBus
+    from .worker import ClusterWorker, get_hardware_info
 
     shared_dir = Path(args.shared_dir)
     device_str, _, _ = get_hardware_info(args.device)
@@ -132,10 +134,15 @@ def cmd_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _get_bus(shared_dir: Path | str):
+    from .bus import ClusterStorageBus
+    return ClusterStorageBus(shared_dir)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """Print current cluster worker fleet and active job telemetry."""
     shared_dir = Path(args.shared_dir)
-    bus = ClusterStorageBus(shared_dir)
+    bus = _get_bus(shared_dir)
 
     print("=" * 70)
     print(f"CLUSTER STATUS — Storage: {shared_dir.resolve()}")
@@ -180,7 +187,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_submit(args: argparse.Namespace) -> int:
     """Submit a new distributed training job."""
     shared_dir = Path(args.shared_dir)
-    bus = ClusterStorageBus(shared_dir)
+    bus = _get_bus(shared_dir)
 
     model_config = {
         "vocab_size": args.vocab_size,
@@ -213,7 +220,7 @@ def cmd_submit(args: argparse.Namespace) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     """Send stop signal to a running job."""
     shared_dir = Path(args.shared_dir)
-    bus = ClusterStorageBus(shared_dir)
+    bus = _get_bus(shared_dir)
     bus.set_job_status(args.job_id, "STOPPED")
     print(f"Stopped job: {args.job_id}")
     return 0
@@ -222,7 +229,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_pause(args: argparse.Namespace) -> int:
     """Send pause signal to a running job."""
     shared_dir = Path(args.shared_dir)
-    bus = ClusterStorageBus(shared_dir)
+    bus = _get_bus(shared_dir)
     bus.set_job_status(args.job_id, "PAUSED")
     print(f"Paused job: {args.job_id}")
     return 0
@@ -231,7 +238,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
 def cmd_resume(args: argparse.Namespace) -> int:
     """Resume a paused job."""
     shared_dir = Path(args.shared_dir)
-    bus = ClusterStorageBus(shared_dir)
+    bus = _get_bus(shared_dir)
     bus.set_job_status(args.job_id, "RUNNING")
     print(f"Resumed job: {args.job_id}")
     return 0

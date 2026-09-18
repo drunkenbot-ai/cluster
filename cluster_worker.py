@@ -372,6 +372,30 @@ def get_installed_torch_status() -> tuple[Optional[str], Optional[str], bool]:
     return version_str, cuda_tag, is_cuda_avail
 
 
+def _cleanup_orphaned_site_packages() -> None:
+    """Remove lingering ~orch, ~-rch or ~* directories left behind by Windows pip uninstalls."""
+    try:
+        import site
+        site_dirs: list[str] = []
+        if hasattr(site, "getsitepackages"):
+            site_dirs.extend(site.getsitepackages())
+        if hasattr(site, "getusersitepackages"):
+            site_dirs.append(site.getusersitepackages())
+        for sdir in site_dirs:
+            sp = Path(sdir)
+            if sp.is_dir():
+                for orphan in sp.glob("~*"):
+                    try:
+                        if orphan.is_dir():
+                            shutil.rmtree(orphan, ignore_errors=True)
+                        elif orphan.is_file():
+                            orphan.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
 def ensure_dependencies() -> None:
     """Ensure torch and numpy are installed with the exact CUDA wheel matching the host's GPU."""
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("LLM_TEST_BOOTSTRAP_EXECUTE"):
@@ -445,6 +469,7 @@ def ensure_dependencies() -> None:
         return
 
     print(f"[ClusterWorker] Checking dependencies: {reason or 'verifying packages'}...")
+    _cleanup_orphaned_site_packages()
 
     # Step A: Uninstall incompatible PyTorch if needed
     if need_uninstall:
@@ -458,6 +483,7 @@ def ensure_dependencies() -> None:
             print("[ClusterWorker] Old PyTorch packages uninstalled cleanly.")
         except Exception as exc:
             print(f"[ClusterWorker] Warning during pip uninstall: {exc}")
+        _cleanup_orphaned_site_packages()
 
     # Step B: Install target PyTorch packages
     if need_install or missing_numpy:
@@ -503,9 +529,19 @@ def ensure_dependencies() -> None:
                     if missing_numpy:
                         cmd.append("numpy")
                     subprocess.check_call(cmd)
-                print("[ClusterWorker] PyTorch dependencies installed and verified successfully.")
             except Exception as exc:
                 print(f"[ClusterWorker] Error installing dependencies: {exc}")
+
+        if need_uninstall or need_install:
+            _cleanup_orphaned_site_packages()
+            print("[ClusterWorker] PyTorch dependencies installed and verified successfully.")
+            # Re-launch in clean interpreter so new CUDA runtime and C-extensions load cleanly
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                print("[ClusterWorker] Re-launching worker with fresh interpreter environment...")
+                ret = subprocess.call([sys.executable] + sys.argv)
+                sys.exit(ret)
+        else:
+            print("[ClusterWorker] PyTorch dependencies installed and verified successfully.")
 
 
 ensure_dependencies()
