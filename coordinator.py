@@ -116,7 +116,24 @@ class ClusterCoordinator:
 
             ready_workers = self.bus.get_ready_workers_for_round(self.job_id, round_num)
             participants = self.bus.get_job_participants(self.job_id)
+
+            # Check if any registered participant has crashed, stopped heartbeat, or gone offline
+            if hasattr(self.bus, "list_workers"):
+                known_workers = {w["worker_id"]: w for w in self.bus.list_workers(active_within_seconds=90.0)}
+                dropped_any = False
+                for p in participants:
+                    pwid = p["worker_id"]
+                    if pwid not in ready_workers:
+                        w_info = known_workers.get(pwid)
+                        if not w_info or not w_info.get("is_online", False) or w_info.get("status") in {"OFFLINE", "DISABLED"}:
+                            print(f"[Coordinator] Active participant '{pwid}' is offline/unresponsive. Marking DROPPED so round aggregation is not blocked.", flush=True)
+                            self.bus.mark_worker_dropped(self.job_id, pwid, reason="offline")
+                            dropped_any = True
+                if dropped_any:
+                    participants = self.bus.get_job_participants(self.job_id)
+
             total_participants = max(len(participants), 1)
+            effective_min_workers = max(1, min(min_workers, total_participants))
 
             if ready_workers and first_ready_time is None:
                 first_ready_time = time.time()
@@ -136,11 +153,11 @@ class ClusterCoordinator:
             # 1. All active registered workers deposited weights
             all_ready = len(ready_workers) >= total_participants
 
-            # 2. Straggler timeout expired and at least min_workers deposited weights
+            # 2. Straggler timeout expired and at least effective_min_workers deposited weights
             timeout_expired = (
                 first_ready_time is not None
                 and (time.time() - first_ready_time) > sync_timeout
-                and len(ready_workers) >= min_workers
+                and len(ready_workers) >= effective_min_workers
             )
 
             if (all_ready or timeout_expired) and ready_workers:

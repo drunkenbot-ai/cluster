@@ -1322,6 +1322,7 @@ class StandaloneStorageBus:
     def delete_worker(self, worker_id: str) -> bool:
         def _op(conn: sqlite3.Connection) -> bool:
             cursor = conn.execute("DELETE FROM workers WHERE worker_id = ?;", (worker_id,))
+            conn.execute("UPDATE job_participants SET status = 'DROPPED' WHERE worker_id = ?;", (worker_id,))
             return cursor.rowcount > 0
         return bool(self._run_with_retry(_op, default_on_error=False))
 
@@ -1333,6 +1334,7 @@ class StandaloneStorageBus:
                 "DELETE FROM workers WHERE status = 'OFFLINE' OR last_heartbeat < ?;",
                 (cutoff,),
             )
+            conn.execute("UPDATE job_participants SET status = 'DROPPED' WHERE worker_id NOT IN (SELECT worker_id FROM workers);")
             return cursor.rowcount
         return int(self._run_with_retry(_op, default_on_error=0))
 
