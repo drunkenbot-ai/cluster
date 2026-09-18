@@ -870,8 +870,9 @@ class ClusterWorker:
             self.log("[Slots Evaluation] Multi-worker slots disabled by CLUSTER_DISABLE_AUTO_SLOTS.")
             return
 
-        if not bool(training_cfg.get("allow_worker_slots", True)):
-            self.log("[Slots Evaluation] Multi-worker slots disabled by job training_config.")
+        # Dedicated single-worker-per-GPU is the safe default for workstation clusters.
+        # Multi-worker slots must be explicitly opted into via allow_worker_slots: True.
+        if not bool(training_cfg.get("allow_worker_slots", False)):
             return
 
         if not self.device_str.startswith("cuda") or not torch.cuda.is_available():
@@ -1059,7 +1060,14 @@ class ClusterWorker:
                 tot_gb = tot_bytes / (1024 ** 3)
             except Exception:
                 tot_gb = 16.0
-            max_safe_tokens = 4096 if tot_gb <= 12.0 else 8192
+            if tot_gb <= 12.0:
+                max_safe_tokens = 4096
+            elif tot_gb >= 15.0 and should_checkpoint:
+                # With activation checkpointing enabled on 16GB+ cards, micro-batches of up to 16,384 tokens
+                # safely utilize ~8-10 GB (50-65% VRAM), accelerating single-worker throughput without risking OOM
+                max_safe_tokens = 16384
+            else:
+                max_safe_tokens = 8192
             safe_micro_bs = max(1, max_safe_tokens // max(ctx_len, 1)) if ctx_len > 0 else 4
         else:
             safe_micro_bs = 999999
@@ -1533,6 +1541,12 @@ class ClusterWorker:
                 # Wait for coordinator to publish global model for this round
                 while not self.bus.is_global_weights_ready(job_id, current_round):
                     if self._stop_event.is_set() or self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
+                        self._current_status = "IDLE"
+                        self._current_job_id = None
+                        try:
+                            self.bus.heartbeat(self.worker_id, status="IDLE", current_job_id=None)
+                        except Exception:
+                            pass
                         return False
                     time.sleep(poll_interval)
 

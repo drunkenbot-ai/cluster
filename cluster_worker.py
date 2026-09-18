@@ -1378,15 +1378,32 @@ class StandaloneStorageBus:
         now = time.time()
         def _op(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
             if max_stale_seconds > 0:
-                conn.execute(
+                cursor = conn.execute(
                     """
-                    UPDATE jobs
-                    SET status = 'STOPPED', updated_at = ?
+                    SELECT job_id FROM jobs
                     WHERE status IN ('RUNNING', 'QUEUED')
                       AND (? - updated_at) > ?;
                     """,
-                    (now, now, max_stale_seconds),
+                    (now, max_stale_seconds),
                 )
+                swept_rows = cursor.fetchall()
+                if swept_rows:
+                    conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'STOPPED', updated_at = ?
+                        WHERE status IN ('RUNNING', 'QUEUED')
+                          AND (? - updated_at) > ?;
+                        """,
+                        (now, now, max_stale_seconds),
+                    )
+                    for sr in swept_rows:
+                        try:
+                            s_dir = self.jobs_dir / sr["job_id"] / "signals"
+                            s_dir.mkdir(parents=True, exist_ok=True)
+                            (s_dir / "stop.sig").touch()
+                        except Exception:
+                            pass
             cursor = conn.execute(
                 "SELECT * FROM jobs WHERE status IN ('RUNNING', 'QUEUED', 'PAUSED') ORDER BY created_at DESC LIMIT 1;"
             )
@@ -1513,10 +1530,26 @@ class StandaloneStorageBus:
             return None
 
     def is_paused(self, job_id: str) -> bool:
-        return (self.jobs_dir / job_id / "signals" / "pause.sig").exists()
+        """Check if pause signal file exists or job status is PAUSED in SQLite."""
+        if (self.jobs_dir / job_id / "signals" / "pause.sig").exists():
+            return True
+        def _op(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("SELECT status FROM jobs WHERE job_id = ?;", (job_id,))
+            row = cursor.fetchone()
+            return bool(row and str(row["status"]).upper() == "PAUSED")
+        return bool(self._run_with_retry(_op, default_on_error=False, silent=True))
 
     def is_stopped(self, job_id: str) -> bool:
-        return (self.jobs_dir / job_id / "signals" / "stop.sig").exists()
+        """Check if stop signal file exists or job status is stopped/completed in SQLite."""
+        if (self.jobs_dir / job_id / "signals" / "stop.sig").exists():
+            return True
+        def _op(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute("SELECT status FROM jobs WHERE job_id = ?;", (job_id,))
+            row = cursor.fetchone()
+            if row and str(row["status"]).upper() in {"STOPPED", "STOPPING", "FAILED", "COMPLETED"}:
+                return True
+            return False
+        return bool(self._run_with_retry(_op, default_on_error=False, silent=True))
 
     def save_worker_weights(self, job_id: str, round_num: int, worker_id: str, state_dict: dict[str, torch.Tensor]) -> None:
         round_dir = self.jobs_dir / job_id / "rounds" / f"round_{round_num:04d}"

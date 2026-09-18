@@ -156,20 +156,39 @@ class ClusterCoordinator:
                 print(f"[Coordinator] Worker '{wid}' failed to deposit weights for round {round_num}. Marking DROPPED to reassign workload.")
                 self.bus.mark_worker_dropped(self.job_id, wid, reason="timeout")
 
-        # Load weights from all ready workers
+        # Load weights from all ready workers with resilient retry
         t_agg_start = time.time()
         worker_states = []
         worker_telemetries: dict[str, dict[str, Any]] = {}
         for wid in ready_workers:
-            state = self.bus.load_worker_weights(self.job_id, round_num, wid, device="cpu")
+            state = None
+            for attempt in range(5):
+                try:
+                    state = self.bus.load_worker_weights(self.job_id, round_num, wid, device="cpu")
+                    if state:
+                        break
+                except Exception as exc:
+                    print(f"[Coordinator] Retrying weight load for '{wid}' (attempt {attempt + 1}/5): {exc}", flush=True)
+                    time.sleep(0.5)
+            if state is None:
+                print(f"[Coordinator] Warning: Could not load weights for worker '{wid}' after 5 attempts. Skipping worker in aggregation.", flush=True)
+                continue
             worker_states.append(state)
-            tel = self.bus.load_worker_telemetry(self.job_id, round_num, wid)
-            if not tel:
-                # Brief retry to handle network SMB/NFS cache latency
-                time.sleep(0.5)
-                tel = self.bus.load_worker_telemetry(self.job_id, round_num, wid)
+
+            tel = None
+            for attempt in range(3):
+                try:
+                    tel = self.bus.load_worker_telemetry(self.job_id, round_num, wid)
+                    if tel:
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.3)
             if tel:
                 worker_telemetries[wid] = tel
+
+        if not worker_states:
+            raise RuntimeError(f"Failed to load valid model weights from any ready worker for round {round_num}.")
 
         # Average weights
         global_state = average_state_dicts(worker_states)
@@ -577,6 +596,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             poll_interval_seconds=args.poll_interval,
             telemetry_callback=_on_round_progress,
         )
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[COORDINATOR FATAL ERROR] {exc}\n{tb}", flush=True)
+        try:
+            bus.log_cluster_event(f"Coordinator crashed with fatal error: {exc}")
+        except Exception:
+            pass
+        success = False
     finally:
         try:
             if pid_file.exists():
