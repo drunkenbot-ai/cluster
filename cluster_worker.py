@@ -2854,11 +2854,38 @@ class StandaloneWorker:
 
                 # Wait for coordinator to publish global model
                 t_sync_start = time.time()
+                last_log_wait = t_sync_start
                 self.log(f"Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
                 while not self.bus.is_global_weights_ready(job_id, cur_round):
                     if self.bus.is_stopped(job_id):
                         return
                     self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
+
+                    now_wait = time.time()
+                    elapsed_sync = now_wait - t_sync_start
+                    if now_wait - last_log_wait >= 30.0:
+                        last_log_wait = now_wait
+                        self.log(f"Waiting for round {cur_round} global weights ({elapsed_sync:.0f}s elapsed)...")
+
+                        # Autonomous fallback: if waiting > 45s and coordinator is inactive or this is the sole node
+                        job_info = self.bus.get_job(job_id) or {}
+                        job_updated = float(job_info.get("updated_at") or 0.0)
+                        coord_unresponsive = (now_wait - job_updated) > 60.0
+                        active_parts = self.bus.get_job_participants(job_id)
+                        sole_worker = (len(active_parts) <= 1) or all(p.get("worker_id") == self.worker_id for p in active_parts)
+
+                        if elapsed_sync > 45.0 and (sole_worker or coord_unresponsive):
+                            self.log(
+                                f"Autonomous sync: Coordinator is inactive or sole node detected ({len(active_parts)} active). "
+                                f"Triggering local round {cur_round} aggregation..."
+                            )
+                            try:
+                                from cluster.coordinator import ClusterCoordinator
+                                coord = ClusterCoordinator(self.bus, job_id)
+                                coord.wait_and_average_round(round_num=cur_round, poll_interval_seconds=0.5)
+                            except Exception as c_err:
+                                self.log(f"Autonomous aggregation notice: {c_err}")
+
                     time.sleep(poll_interval)
 
                 sync_wait_sec = max(time.time() - t_sync_start, 0.0)
