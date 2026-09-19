@@ -1741,9 +1741,10 @@ class ClusterWorker:
         try:
             # Suppress/disable dynamo compiler hooks for preflight validation
             try:
-                import torch._dynamo
-                torch._dynamo.config.suppress_errors = True
-                torch._dynamo.disable()
+                import importlib
+                dynamo = importlib.import_module("torch._dynamo")
+                dynamo.config.suppress_errors = True
+                dynamo.disable()
             except Exception:
                 pass
 
