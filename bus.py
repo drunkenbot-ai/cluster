@@ -630,8 +630,10 @@ class ClusterStorageBus:
                     candidate = alt
         if candidate.exists():
             obj = safe_torch_load(candidate, device=device)
-            if isinstance(obj, dict) and "model_state_dict" in obj:
-                return obj["model_state_dict"]
+            if isinstance(obj, dict):
+                for k in ("model_state_dict", "state_dict", "model"):
+                    if k in obj and isinstance(obj[k], dict):
+                        return obj[k]
             return obj
         return None
 

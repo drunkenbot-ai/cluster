@@ -1346,21 +1346,26 @@ class ClusterWorker:
                 self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str, logger=self.log)
 
-                # Check if this is a fine-tuning job and load base model weights
+                # Check if this is a fine-tuning job or pretraining resume, and load base model weights
                 job_type = str(job.get("job_type") or training_config.get("training_mode") or "pretrain").lower()
                 is_fine_tune = (job_type == "fine_tune")
+                has_base = bool(job.get("base_checkpoint_path"))
 
-                if is_fine_tune:
-                    self.log("Fine-tuning job detected. Loading base checkpoint weights from shared storage...")
+                if is_fine_tune or has_base:
+                    mode_desc = "Fine-tuning base" if is_fine_tune else "Pretraining resume"
+                    self.log(f"{mode_desc} checkpoint detected. Loading initial checkpoint weights from shared storage...")
                     base_weights = self.bus.load_base_model_weights(job_id, device=self.device_str)
                     if base_weights is not None:
                         try:
                             missing, unexpected = model.load_state_dict(base_weights, strict=False)
-                            self.log(f"Base model weights loaded successfully for fine-tuning. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
+                            self.log(f"{mode_desc} model weights loaded successfully. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
                         except Exception as e:
-                            self.log(f"Warning: Failed to load some base weights: {e}", level="WARNING")
+                            self.log(f"Warning: Failed to load initial weights: {e}", level="WARNING")
                     else:
-                        self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+                        if is_fine_tune:
+                            self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+                        else:
+                            self.log("Notice: Resume checkpoint not found on shared storage. Initializing from scratch.", level="WARNING")
 
                 # Apply LoRA if configured
                 peft_method = str(job.get("peft_method") or training_config.get("peft_method") or "none").lower()

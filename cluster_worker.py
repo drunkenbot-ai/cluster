@@ -1619,8 +1619,10 @@ class StandaloneStorageBus:
                     candidate = alt
         if candidate.exists():
             obj = safe_torch_load(candidate, device=device)
-            if isinstance(obj, dict) and "model_state_dict" in obj:
-                return obj["model_state_dict"]
+            if isinstance(obj, dict):
+                for k in ("model_state_dict", "state_dict", "model"):
+                    if k in obj and isinstance(obj[k], dict):
+                        return obj[k]
             return obj
         return None
 
@@ -2606,21 +2608,26 @@ class StandaloneWorker:
 
             model = build_worker_model(model_cfg, self.device_str)
 
-            # Check if this is a fine-tuning job and load base model weights
+            # Check if this is a fine-tuning job or pretraining resume, and load base model weights
             job_type = str(job.get("job_type") or training_cfg.get("training_mode") or "pretrain").lower()
             is_fine_tune = (job_type == "fine_tune")
+            has_base = bool(job.get("base_checkpoint_path"))
 
-            if is_fine_tune:
-                self.log("Fine-tuning job detected. Loading base checkpoint weights from shared storage...")
+            if is_fine_tune or has_base:
+                mode_desc = "Fine-tuning base" if is_fine_tune else "Pretraining resume"
+                self.log(f"{mode_desc} checkpoint detected. Loading initial checkpoint weights from shared storage...")
                 base_weights = self.bus.load_base_model_weights(job_id, device=self.device_str)
                 if base_weights is not None:
                     try:
                         missing, unexpected = model.load_state_dict(base_weights, strict=False)
-                        self.log(f"Base model weights loaded successfully for fine-tuning. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
+                        self.log(f"{mode_desc} model weights loaded successfully. (Missing keys: {len(missing)}, unexpected keys: {len(unexpected)})")
                     except Exception as e:
-                        self.log(f"Warning: Failed to load some base weights: {e}", level="WARNING")
+                        self.log(f"Warning: Failed to load initial weights: {e}", level="WARNING")
                 else:
-                    self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+                    if is_fine_tune:
+                        self.log("Notice: No base model weights found on shared storage. Initializing from scratch.", level="WARNING")
+                    else:
+                        self.log("Notice: Resume checkpoint not found on shared storage. Initializing from scratch.", level="WARNING")
 
             # Apply LoRA if configured
             peft_method = str(job.get("peft_method") or training_cfg.get("peft_method") or "none").lower()
