@@ -1293,7 +1293,11 @@ class ClusterWorker:
                 _, tot_bytes = torch.cuda.mem_get_info(dev_idx)
                 tot_gb = tot_bytes / (1024 ** 3)
             except Exception:
-                tot_gb = 16.0
+                try:
+                    tot_bytes = torch.cuda.get_device_properties(dev_idx).total_memory
+                    tot_gb = tot_bytes / (1024 ** 3)
+                except Exception:
+                    tot_gb = float(training_cfg.get("vram_required_gb", 8.0))
 
             # Scale max_safe_tokens to target 85-90% VRAM utilization while capping
             # per-kernel execution to prevent Windows WDDM driver watchdog (TDR) timeouts
