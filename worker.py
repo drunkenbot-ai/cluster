@@ -1361,6 +1361,25 @@ class ClusterWorker:
             is_step_boundary = (accumulated_batches % grad_accum == 0) or (step + 1 == steps_per_round)
 
             if is_step_boundary:
+                # Apply cosine learning rate schedule with linear warmup across rounds
+                t_cfg = training_cfg if isinstance(training_cfg, dict) else {}
+                base_lr = float(t_cfg.get("learning_rate", 3e-4))
+                max_rounds = int(job.get("max_rounds", 10)) if isinstance(job, dict) else 10
+                total_steps = max(1, max_rounds * steps_per_round)
+                warmup_steps = int(t_cfg.get("warmup_steps", max(10, total_steps // 20)))
+                warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
+                min_ratio = float(t_cfg.get("scheduler_min_lr_ratio", 0.1))
+                global_step = round_num * steps_per_round + step
+                if global_step < warmup_steps:
+                    lr_mult = max(global_step + 1, 1) / max(warmup_steps, 1)
+                else:
+                    prog = (global_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                    prog = max(0.0, min(prog, 1.0))
+                    lr_mult = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
+                current_lr = base_lr * lr_mult
+                for pg in optimizer.param_groups:
+                    pg["lr"] = current_lr
+
                 if scaler is not None:
                     if max_grad > 0:
                         scaler.unscale_(optimizer)
@@ -1458,9 +1477,33 @@ class ClusterWorker:
                         if cand_shared_val.exists():
                             val_dataset_path = str(cand_shared_val)
 
+                targets_path = job.get("targets_path")
+                if not targets_path or not os.path.exists(targets_path):
+                    cand_tgt = Path(dataset_path).parent / "train_targets.npy"
+                    if cand_tgt.exists():
+                        targets_path = str(cand_tgt)
+                    else:
+                        cand_stgt = self.bus.shared_dir / "train_targets.npy"
+                        if cand_stgt.exists():
+                            targets_path = str(cand_stgt)
+
+                val_targets_path = job.get("val_targets_path")
+                if not val_targets_path or not os.path.exists(val_targets_path):
+                    cand_vtgt = Path(dataset_path).parent / "val_targets.npy"
+                    if cand_vtgt.exists():
+                        val_targets_path = str(cand_vtgt)
+                    else:
+                        cand_svtgt = self.bus.shared_dir / "val_targets.npy"
+                        if cand_svtgt.exists():
+                            val_targets_path = str(cand_svtgt)
+
                 target_cache_files = {Path(dataset_path).name}
                 if val_dataset_path and os.path.exists(val_dataset_path):
                     target_cache_files.add(Path(val_dataset_path).name)
+                if targets_path and os.path.exists(targets_path):
+                    target_cache_files.add(Path(targets_path).name)
+                if val_targets_path and os.path.exists(val_targets_path):
+                    target_cache_files.add(Path(val_targets_path).name)
 
                 # Primary worker purges stale .npy files from local SSD cache before copying new
                 if self.ephemeral_job_id is None:
@@ -1485,6 +1528,22 @@ class ClusterWorker:
                         keep_files=target_cache_files,
                         progress_callback=_on_cache_progress,
                     )
+                local_targets_path = None
+                if targets_path and os.path.exists(targets_path):
+                    local_targets_path = cache_dataset_to_local(
+                        targets_path,
+                        log_fn=self.log,
+                        keep_files=target_cache_files,
+                        progress_callback=_on_cache_progress,
+                    )
+                local_val_targets_path = None
+                if val_targets_path and os.path.exists(val_targets_path):
+                    local_val_targets_path = cache_dataset_to_local(
+                        val_targets_path,
+                        log_fn=self.log,
+                        keep_files=target_cache_files,
+                        progress_callback=_on_cache_progress,
+                    )
                 self._current_status = "PREPARING"
 
                 # Clean up any stale auxiliary child processes from previous runs (primary daemon only)
@@ -1504,6 +1563,7 @@ class ClusterWorker:
 
                 self.log(f"Mapping dataset: {local_dataset_path}...")
                 token_array = np.load(local_dataset_path, mmap_mode="r")
+                target_array = np.load(local_targets_path, mmap_mode="r") if (local_targets_path and os.path.exists(local_targets_path)) else None
                 vocab_size = int(model_config.get("vocab_size", 0) or 0)
 
                 # 1. Inspect metadata files if present on shared storage or dataset dir
@@ -1566,35 +1626,62 @@ class ClusterWorker:
                     vocab_size = target_vocab
                     model_config["vocab_size"] = vocab_size
 
+                # 5. Prepare training & validation datasets
+                val_token_array = None
+                val_target_array = None
+                train_token_array = token_array
+                train_target_array = target_array
+
+                if local_val_dataset_path and os.path.exists(local_val_dataset_path):
+                    try:
+                        v_arr = np.load(local_val_dataset_path, mmap_mode="r")
+                        if len(v_arr) > context_length:
+                            val_token_array = v_arr
+                            if local_val_targets_path and os.path.exists(local_val_targets_path):
+                                val_target_array = np.load(local_val_targets_path, mmap_mode="r")
+                            self.log(f"External validation dataset mapped ({len(val_token_array):,} tokens).")
+                    except Exception as e:
+                        self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
+
+                # Automatic fallback: if no external val dataset, hold out the last 5% of tokens
+                if val_token_array is None and len(token_array) > (context_length * 2):
+                    val_size = min(50000, max(context_length * 2, int(len(token_array) * 0.05)))
+                    val_token_array = token_array[-val_size:]
+                    train_token_array = token_array[:-val_size]
+                    if target_array is not None:
+                        val_target_array = target_array[-val_size:]
+                        train_target_array = target_array[:-val_size]
+                    self.log(f"Held out {len(val_token_array):,} tokens (5%) from dataset for continuous round validation evaluation.")
+
                 dataset = ShardedTokenDataset(
-                    token_array=token_array,
+                    token_array=train_token_array,
                     context_length=context_length,
                     shard_index=shard_idx,
                     total_shards=total_shards,
+                    target_array=train_target_array,
                     vocab_size=vocab_size,
                 )
                 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
                 dataloader_iter = iter(dataloader)
 
-                # 5. Prepare validation dataset if available alongside train tokens
-                if local_val_dataset_path and os.path.exists(local_val_dataset_path):
+                if val_token_array is not None and len(val_token_array) > context_length:
                     try:
-                        val_token_array = np.load(local_val_dataset_path, mmap_mode="r")
-                        if len(val_token_array) > context_length:
-                            val_dataset = ShardedTokenDataset(
-                                token_array=val_token_array,
-                                context_length=context_length,
-                                shard_index=shard_idx,
-                                total_shards=total_shards,
-                                vocab_size=vocab_size,
-                            )
+                        val_dataset = ShardedTokenDataset(
+                            token_array=val_token_array,
+                            context_length=context_length,
+                            shard_index=shard_idx,
+                            total_shards=total_shards,
+                            target_array=val_target_array,
+                            vocab_size=vocab_size,
+                        )
+                        if len(val_dataset) > 0:
                             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-                            self.log(f"Validation dataset mapped ({len(val_token_array):,} tokens, {len(val_dataset):,} samples).")
+                            self.log(f"Validation DataLoader ready ({len(val_dataset)} sample windows).")
                     except Exception as e:
-                        self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
+                        self.log(f"Could not build validation DataLoader: {e}", level="WARNING")
 
                 # 6. Build model and optimizer
-                self.log(f"Dataset mapped ({len(token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
+                self.log(f"Dataset mapped ({len(train_token_array):,} tokens, vocab_size={vocab_size}). Building model for {self.device_str}...")
                 model = build_model_from_config(model_config, self.device_str, logger=self.log)
 
                 # Check if this is a fine-tuning job or pretraining resume, and load base model weights
@@ -1638,11 +1725,35 @@ class ClusterWorker:
                     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                     self.log(f"LoRA adapters applied to {num_lora} modules. Trainable parameters: {trainable_params:,} (base model frozen).")
 
-                # Create optimizer only over trainable parameters
-                trainable_params = [p for p in model.parameters() if p.requires_grad]
-                self.log(f"Model ready. Creating AdamW optimizer for {len(trainable_params)} tensor(s) (lr={lr})...")
+                # Create optimizer with separated weight decay groups (frontier LLM standard)
+                weight_decay = float(training_config.get("weight_decay", 0.01))
+                decay_params = []
+                nodecay_params = []
+                seen_param_ids = set()
+                for p in model.parameters():
+                    if not p.requires_grad:
+                        continue
+                    if id(p) in seen_param_ids:
+                        continue
+                    seen_param_ids.add(id(p))
+                    if p.dim() >= 2:
+                        decay_params.append(p)
+                    else:
+                        nodecay_params.append(p)
+
+                optim_groups = []
+                if decay_params:
+                    optim_groups.append({"params": decay_params, "weight_decay": weight_decay})
+                if nodecay_params:
+                    optim_groups.append({"params": nodecay_params, "weight_decay": 0.0})
+
+                device_is_cuda = self.device_str.startswith("cuda") and torch.cuda.is_available()
+                self.log(f"Model ready. Creating AdamW optimizer for {len(decay_params)} 2D matrix weights (decay={weight_decay}) and {len(nodecay_params)} 1D tensors (no decay), lr={lr}...")
                 t_opt = time.time()
-                optimizer = torch.optim.AdamW(trainable_params, lr=lr)
+                try:
+                    optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=device_is_cuda)
+                except Exception:
+                    optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
                 self.log(f"Optimizer created in {time.time() - t_opt:.2f}s on '{self.device_str}'. Ready to train {max_rounds} rounds.")
 
                 # Ensure activation checkpointing is active for long contexts or when configured
@@ -1689,10 +1800,11 @@ class ClusterWorker:
                         self.log(f"Active worker pool updated. Shard reallocated: {new_shard_idx + 1} of {new_total_shards} nodes.")
                         shard_idx, total_shards = new_shard_idx, new_total_shards
                         dataset = ShardedTokenDataset(
-                            token_array=token_array,
+                            token_array=train_token_array,
                             context_length=context_length,
                             shard_index=shard_idx,
                             total_shards=total_shards,
+                            target_array=train_target_array,
                             vocab_size=vocab_size,
                         )
                         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -1704,6 +1816,7 @@ class ClusterWorker:
                                     context_length=context_length,
                                     shard_index=shard_idx,
                                     total_shards=total_shards,
+                                    target_array=val_target_array,
                                     vocab_size=vocab_size,
                                 )
                                 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)

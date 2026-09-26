@@ -335,6 +335,9 @@ class ClusterStorageBus:
                     base_checkpoint_path TEXT,
                     peft_method TEXT DEFAULT 'none',
                     lora_config TEXT,
+                    val_dataset_path TEXT,
+                    targets_path TEXT,
+                    val_targets_path TEXT,
                     created_at REAL,
                     updated_at REAL
                 );
@@ -344,6 +347,9 @@ class ClusterStorageBus:
                 ("base_checkpoint_path", "TEXT"),
                 ("peft_method", "TEXT DEFAULT 'none'"),
                 ("lora_config", "TEXT"),
+                ("val_dataset_path", "TEXT"),
+                ("targets_path", "TEXT"),
+                ("val_targets_path", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {col_def[0]} {col_def[1]};")
@@ -588,6 +594,9 @@ class ClusterStorageBus:
         base_checkpoint_path: Optional[str] = None,
         peft_method: str = "none",
         lora_config: Optional[dict[str, Any]] = None,
+        val_dataset_path: Optional[str] = None,
+        targets_path: Optional[str] = None,
+        val_targets_path: Optional[str] = None,
     ) -> None:
         """Create a new distributed training job."""
         now = time.time()
@@ -595,6 +604,26 @@ class ClusterStorageBus:
         job_dir.mkdir(parents=True, exist_ok=True)
         (job_dir / "signals").mkdir(parents=True, exist_ok=True)
         (job_dir / "rounds").mkdir(parents=True, exist_ok=True)
+
+        if not val_dataset_path and dataset_path:
+            ds_p = Path(dataset_path)
+            cand_v = ds_p.parent / "val_tokens.npy" if ds_p.is_file() else ds_p / "val_tokens.npy"
+            if cand_v.exists():
+                val_dataset_path = str(cand_v)
+            elif (self.shared_dir / "val_tokens.npy").exists():
+                val_dataset_path = str(self.shared_dir / "val_tokens.npy")
+
+        if not targets_path and dataset_path:
+            ds_p = Path(dataset_path)
+            cand_t = ds_p.parent / "train_targets.npy" if ds_p.is_file() else ds_p / "train_targets.npy"
+            if cand_t.exists():
+                targets_path = str(cand_t)
+
+        if not val_targets_path and dataset_path:
+            ds_p = Path(dataset_path)
+            cand_vt = ds_p.parent / "val_targets.npy" if ds_p.is_file() else ds_p / "val_targets.npy"
+            if cand_vt.exists():
+                val_targets_path = str(cand_vt)
 
         staged_base_path = None
         if base_checkpoint_path and os.path.exists(base_checkpoint_path):
@@ -645,9 +674,10 @@ class ClusterStorageBus:
                     job_id, status, model_config, training_config, dataset_path,
                     current_round, max_rounds, sync_interval_steps, min_workers,
                     sync_timeout_seconds, job_type, base_checkpoint_path,
-                    peft_method, lora_config, created_at, updated_at
+                    peft_method, lora_config, val_dataset_path, targets_path,
+                    val_targets_path, created_at, updated_at
                 )
-                VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, 'QUEUED', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
                 job_id,
                 json.dumps(model_config, default=str),
@@ -661,6 +691,9 @@ class ClusterStorageBus:
                 staged_base_path or (str(base_checkpoint_path) if base_checkpoint_path else None),
                 peft_method,
                 json.dumps(lora_config, default=str) if lora_config else None,
+                str(val_dataset_path) if val_dataset_path else None,
+                str(targets_path) if targets_path else None,
+                str(val_targets_path) if val_targets_path else None,
                 now,
                 now,
             ))

@@ -1892,12 +1892,14 @@ def compute_shard_boundaries(total_tokens: int, shard_index: int, total_shards: 
 
 
 class StandaloneTokenDataset(Dataset):
-    def __init__(self, token_array: np.ndarray, context_length: int, shard_index: int = 0, total_shards: int = 1, vocab_size: Optional[int] = None) -> None:
+    def __init__(self, token_array: np.ndarray, context_length: int, shard_index: int = 0, total_shards: int = 1, vocab_size: Optional[int] = None, target_array: Optional[np.ndarray] = None) -> None:
         self.context_length = context_length
         self.vocab_size = vocab_size
+        self.has_targets = target_array is not None
         total_tokens = len(token_array)
         start_idx, end_idx = compute_shard_boundaries(total_tokens, shard_index, total_shards, context_length)
         self.tokens = token_array[start_idx:end_idx]
+        self.targets = target_array[start_idx:end_idx] if self.has_targets else None
         usable = len(self.tokens) - self.context_length
         self.sample_count = max(0, (usable // self.context_length) + 1) if usable >= 0 else 0
 
@@ -1908,13 +1910,16 @@ class StandaloneTokenDataset(Dataset):
         start = idx * self.context_length
         end = start + self.context_length
         x = torch.from_numpy(self.tokens[start:end].astype(np.int64))
-        if end < len(self.tokens):
-            y = torch.from_numpy(self.tokens[start + 1 : end + 1].astype(np.int64))
+        if self.has_targets and self.targets is not None:
+            y = torch.from_numpy(self.targets[start:end].astype(np.int64))
         else:
-            y = x.clone()
+            if end < len(self.tokens):
+                y = torch.from_numpy(self.tokens[start + 1 : end + 1].astype(np.int64))
+            else:
+                y = x.clone()
         if self.vocab_size is not None and self.vocab_size > 0:
             x = torch.clamp(x, 0, self.vocab_size - 1)
-            y = torch.clamp(y, 0, self.vocab_size - 1)
+            y = torch.where(y == -100, y, torch.clamp(y, 0, self.vocab_size - 1))
         return x, y
 
 
@@ -2616,12 +2621,42 @@ class StandaloneWorker:
                     if cand_shared_val.exists():
                         val_dataset_path = str(cand_shared_val)
 
+            targets_path = job.get("targets_path")
+            if not targets_path or not os.path.exists(targets_path):
+                cand_tgt = Path(dataset_path).parent / "train_targets.npy"
+                if cand_tgt.exists():
+                    targets_path = str(cand_tgt)
+                else:
+                    cand_stgt = self.bus.shared_dir / "train_targets.npy"
+                    if cand_stgt.exists():
+                        targets_path = str(cand_stgt)
+
+            val_targets_path = job.get("val_targets_path")
+            if not val_targets_path or not os.path.exists(val_targets_path):
+                cand_vtgt = Path(dataset_path).parent / "val_targets.npy"
+                if cand_vtgt.exists():
+                    val_targets_path = str(cand_vtgt)
+                else:
+                    cand_svtgt = self.bus.shared_dir / "val_targets.npy"
+                    if cand_svtgt.exists():
+                        val_targets_path = str(cand_svtgt)
+
             target_cache_files = {Path(dataset_path).name}
             if val_dataset_path and os.path.exists(val_dataset_path):
                 target_cache_files.add(Path(val_dataset_path).name)
+            if targets_path and os.path.exists(targets_path):
+                target_cache_files.add(Path(targets_path).name)
+            if val_targets_path and os.path.exists(val_targets_path):
+                target_cache_files.add(Path(val_targets_path).name)
 
             purge_local_dataset_cache(keep_files=target_cache_files, log_fn=self.log)
             local_dataset_path = cache_dataset_to_local(dataset_path, log_fn=self.log, keep_files=target_cache_files)
+            local_targets_path = None
+            if targets_path and os.path.exists(targets_path):
+                local_targets_path = cache_dataset_to_local(targets_path, log_fn=self.log, keep_files=target_cache_files)
+            local_val_targets_path = None
+            if val_targets_path and os.path.exists(val_targets_path):
+                local_val_targets_path = cache_dataset_to_local(val_targets_path, log_fn=self.log, keep_files=target_cache_files)
 
             if not os.path.exists(local_dataset_path):
                 err = f"Dataset not found at: {local_dataset_path}"
@@ -2630,6 +2665,7 @@ class StandaloneWorker:
                 return
 
             token_array = np.load(local_dataset_path, mmap_mode="r")
+            target_array = np.load(local_targets_path, mmap_mode="r") if (local_targets_path and os.path.exists(local_targets_path)) else None
             model_cfg = job.get("model_config", {})
             training_cfg = job.get("training_config", {})
 
@@ -2700,19 +2736,48 @@ class StandaloneWorker:
             batch_size = int(training_cfg.get("batch_size", 4))
             lr = float(training_cfg.get("learning_rate", 3e-4))
 
-            dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-            dataloader_iter = iter(dataloader)
+            val_token_array = None
+            val_target_array = None
+            train_token_array = token_array
+            train_target_array = target_array
 
             # Prepare validation dataset if available
             if val_dataset_path and os.path.exists(val_dataset_path):
                 try:
                     local_val_path = cache_dataset_to_local(val_dataset_path, log_fn=self.log, keep_files=target_cache_files)
-                    val_token_array = np.load(local_val_path, mmap_mode="r")
-                    if len(val_token_array) > context_length:
-                        val_ds = StandaloneTokenDataset(val_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
+                    v_arr = np.load(local_val_path, mmap_mode="r")
+                    if len(v_arr) > context_length:
+                        val_token_array = v_arr
+                        if local_val_targets_path and os.path.exists(local_val_targets_path):
+                            val_target_array = np.load(local_val_targets_path, mmap_mode="r")
+                        self.log(f"External validation dataset mapped ({len(val_token_array):,} tokens).")
+                except Exception as e:
+                    self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
+
+            # Automatic fallback: if no external val dataset, hold out the last 5% of tokens
+            if val_token_array is None and len(token_array) > (context_length * 2):
+                val_size = min(50000, max(context_length * 2, int(len(token_array) * 0.05)))
+                val_token_array = token_array[-val_size:]
+                train_token_array = token_array[:-val_size]
+                if target_array is not None:
+                    val_target_array = target_array[-val_size:]
+                    train_target_array = target_array[:-val_size]
+                self.log(f"Held out {len(val_token_array):,} tokens (5%) from dataset for continuous round validation evaluation.")
+
+            dataset = StandaloneTokenDataset(
+                train_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size, target_array=train_target_array
+            )
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataloader_iter = iter(dataloader)
+
+            if val_token_array is not None and len(val_token_array) > context_length:
+                try:
+                    val_ds = StandaloneTokenDataset(
+                        val_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size, target_array=val_target_array
+                    )
+                    if len(val_ds) > 0:
                         val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-                        self.log(f"Validation dataset mapped ({len(val_token_array):,} tokens).")
+                        self.log(f"Validation DataLoader ready ({len(val_ds)} sample windows).")
                 except Exception as e:
                     self.log(f"Could not initialize validation dataset: {e}", level="WARNING")
 
@@ -2759,9 +2824,34 @@ class StandaloneWorker:
                 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
                 self.log(f"LoRA adapters applied to {num_lora} modules. Trainable parameters: {trainable_params:,} (base model frozen).")
 
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(trainable_params, lr=lr)
-            self.log(f"Initialized model for {self.worker_id} on {self.device_str} ({len(trainable_params)} trainable tensor(s)). Ready to train.")
+            # Create optimizer with separated weight decay groups (frontier LLM standard)
+            weight_decay = float(training_cfg.get("weight_decay", 0.01))
+            decay_params = []
+            nodecay_params = []
+            seen_param_ids = set()
+            for p in model.parameters():
+                if not p.requires_grad:
+                    continue
+                if id(p) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(p))
+                if p.dim() >= 2:
+                    decay_params.append(p)
+                else:
+                    nodecay_params.append(p)
+
+            optim_groups = []
+            if decay_params:
+                optim_groups.append({"params": decay_params, "weight_decay": weight_decay})
+            if nodecay_params:
+                optim_groups.append({"params": nodecay_params, "weight_decay": 0.0})
+
+            device_is_cuda = self.device_str.startswith("cuda") and torch.cuda.is_available()
+            try:
+                optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=device_is_cuda)
+            except Exception:
+                optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
+            self.log(f"Initialized model for {self.worker_id} on {self.device_str} ({len(decay_params)} 2D matrix weights, {len(nodecay_params)} 1D tensors). Ready to train.")
 
             # Ensure activation checkpointing is active for long contexts or when configured
             act_ckpt = bool(training_cfg.get("activation_checkpointing", False) or context_length >= 1024)
@@ -2866,9 +2956,19 @@ class StandaloneWorker:
                     if new_shard_idx != shard_idx or new_total_shards != total_shards:
                         self.log(f"Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
                         shard_idx, total_shards = new_shard_idx, new_total_shards
-                        dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
+                        dataset = StandaloneTokenDataset(
+                            train_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size, target_array=train_target_array
+                        )
                         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
                         dataloader_iter = iter(dataloader)
+                        if val_token_array is not None and len(val_token_array) > context_length:
+                            try:
+                                val_ds = StandaloneTokenDataset(
+                                    val_token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size, target_array=val_target_array
+                                )
+                                val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+                            except Exception:
+                                pass
                 except Exception as shard_err:
                     self.log(f"Notice: Shard check deferred due to busy database ({shard_err}). Retaining shard {shard_idx + 1}/{total_shards}.", level="WARNING")
 
@@ -2993,6 +3093,24 @@ class StandaloneWorker:
 
                     max_grad = float(training_cfg.get("max_gradient") or training_cfg.get("max_grad") or 1.0)
                     if is_step_boundary:
+                        # Apply cosine learning rate schedule with linear warmup across rounds
+                        t_cfg = training_cfg if isinstance(training_cfg, dict) else {}
+                        base_lr = float(t_cfg.get("learning_rate", 3e-4))
+                        total_steps = max(1, max_rounds * sync_steps)
+                        warmup_steps = int(t_cfg.get("warmup_steps", max(10, total_steps // 20)))
+                        warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
+                        min_ratio = float(t_cfg.get("scheduler_min_lr_ratio", 0.1))
+                        global_step = cur_round * sync_steps + step_idx
+                        if global_step < warmup_steps:
+                            lr_mult = max(global_step + 1, 1) / max(warmup_steps, 1)
+                        else:
+                            prog = (global_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                            prog = max(0.0, min(prog, 1.0))
+                            lr_mult = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
+                        current_lr = base_lr * lr_mult
+                        for pg in optimizer.param_groups:
+                            pg["lr"] = current_lr
+
                         if scaler is not None:
                             if max_grad > 0:
                                 scaler.unscale_(optimizer)
