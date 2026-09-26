@@ -104,33 +104,41 @@ class ClusterCoordinator:
 
         started_wait = time.time()
         first_ready_time: Optional[float] = None
+        last_touch = 0.0
+        last_part_check = 0.0
+        participants: list[dict[str, Any]] = []
 
         while True:
-            # Signal coordinator liveness
-            if hasattr(self.bus, "touch_job"):
+            now_loop = time.time()
+            # Signal coordinator liveness periodically (every 5.0s) rather than every sub-second loop
+            if hasattr(self.bus, "touch_job") and (now_loop - last_touch >= 5.0):
                 self.bus.touch_job(self.job_id)
+                last_touch = now_loop
 
             # Check for stop signal
             if self.bus.is_stopped(self.job_id):
                 return None
 
             ready_workers = self.bus.get_ready_workers_for_round(self.job_id, round_num)
-            participants = self.bus.get_job_participants(self.job_id)
 
-            # Check if any registered participant has crashed, stopped heartbeat, or gone offline
-            if hasattr(self.bus, "list_workers"):
-                known_workers = {w["worker_id"]: w for w in self.bus.list_workers(active_within_seconds=90.0)}
-                dropped_any = False
-                for p in participants:
-                    pwid = p["worker_id"]
-                    if pwid not in ready_workers:
-                        w_info = known_workers.get(pwid)
-                        if not w_info or not w_info.get("is_online", False) or w_info.get("status") in {"OFFLINE", "DISABLED"}:
-                            print(f"[Coordinator] Active participant '{pwid}' is offline/unresponsive. Marking DROPPED so round aggregation is not blocked.", flush=True)
-                            self.bus.mark_worker_dropped(self.job_id, pwid, reason="offline")
-                            dropped_any = True
-                if dropped_any:
-                    participants = self.bus.get_job_participants(self.job_id)
+            # Query participants and check worker health every 3.0s or initially
+            if not participants or (now_loop - last_part_check >= 3.0):
+                participants = self.bus.get_job_participants(self.job_id)
+                last_part_check = now_loop
+                # Check if any registered participant has crashed, stopped heartbeat, or gone offline
+                if hasattr(self.bus, "list_workers"):
+                    known_workers = {w["worker_id"]: w for w in self.bus.list_workers(active_within_seconds=90.0)}
+                    dropped_any = False
+                    for p in participants:
+                        pwid = p["worker_id"]
+                        if pwid not in ready_workers:
+                            w_info = known_workers.get(pwid)
+                            if not w_info or not w_info.get("is_online", False) or w_info.get("status") in {"OFFLINE", "DISABLED"}:
+                                print(f"[Coordinator] Active participant '{pwid}' is offline/unresponsive. Marking DROPPED so round aggregation is not blocked.", flush=True)
+                                self.bus.mark_worker_dropped(self.job_id, pwid, reason="offline")
+                                dropped_any = True
+                    if dropped_any:
+                        participants = self.bus.get_job_participants(self.job_id)
 
             total_participants = max(len(participants), 1)
             effective_min_workers = max(1, min(min_workers, total_participants))

@@ -82,6 +82,9 @@ def safe_torch_load(
     return torch.load(str(p), map_location=device)
 
 
+_DEFAULT_NOT_SET = object()
+
+
 class ClusterStorageBus:
     """Manages SQLite state and file-based message exchange on central shared storage."""
 
@@ -102,15 +105,17 @@ class ClusterStorageBus:
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         """Ephemeral connection context manager with retries to handle network storage locking."""
         conn = None
-        for attempt in range(5):
+        for attempt in range(8):
             try:
                 conn = sqlite3.connect(
                     str(self.db_path),
-                    timeout=5.0,
+                    timeout=30.0,
                     isolation_level="DEFERRED",
                 )
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute("PRAGMA busy_timeout = 30000;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA temp_store = MEMORY;")
                 break
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 err_msg = str(exc).lower()
@@ -120,9 +125,9 @@ class ClusterStorageBus:
                         continue
                     except Exception:
                         pass
-                if attempt == 4:
+                if attempt == 7:
                     raise
-                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
+                time.sleep(min(2.0, 0.05 * (1.6 ** attempt) + random.uniform(0.03, 0.15)))
         try:
             yield conn
             if conn and conn.in_transaction:
@@ -154,6 +159,7 @@ class ClusterStorageBus:
         salvaged_data: dict[str, list[dict[str, Any]]] = {}
 
         # 1. Attempt to salvage rows from undamaged tables via a read-only connection
+        conn_old = None
         try:
             conn_old = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
             conn_old.row_factory = sqlite3.Row
@@ -163,14 +169,38 @@ class ClusterStorageBus:
                     salvaged_data[tbl] = [dict(r) for r in cursor.fetchall()]
                 except Exception:
                     pass
-            conn_old.close()
         except Exception:
             pass
+        finally:
+            if conn_old is not None:
+                try:
+                    conn_old.close()
+                except Exception:
+                    pass
+                del conn_old
+            import gc
+            gc.collect()
 
         # 2. Rename the corrupted database file out of the way
         try:
             if self.db_path.exists():
-                shutil.move(str(self.db_path), str(corrupt_backup))
+                moved = False
+                for _ in range(5):
+                    try:
+                        shutil.move(str(self.db_path), str(corrupt_backup))
+                        moved = True
+                        break
+                    except Exception:
+                        import gc
+                        gc.collect()
+                        time.sleep(0.1)
+                if not moved:
+                    try:
+                        shutil.copy2(str(self.db_path), str(corrupt_backup))
+                        self.db_path.unlink(missing_ok=True)
+                    except Exception as fallback_err:
+                        print(f"[ClusterStorageBus] Could not archive corrupt database: {fallback_err}")
+                        return False
             for ext in ["-journal", "-wal", "-shm"]:
                 j_file = self.shared_dir / f"cluster.db{ext}"
                 if j_file.exists():
@@ -214,8 +244,8 @@ class ClusterStorageBus:
     def _run_with_retry(
         self,
         fn: Callable[[sqlite3.Connection], Any],
-        max_retries: int = 5,
-        default_on_error: Any = None,
+        max_retries: int = 10,
+        default_on_error: Any = _DEFAULT_NOT_SET,
         silent: bool = False,
     ) -> Any:
         """Execute a database function with automatic retry on SQLite operational/locking errors."""
@@ -234,15 +264,20 @@ class ClusterStorageBus:
                                 return fn(conn)
                     except Exception as rec_err:
                         print(f"[ClusterStorageBus] Database self-healing retry failed: {rec_err}")
-                        if silent:
+                        if default_on_error is not _DEFAULT_NOT_SET:
                             return default_on_error
+                        if silent:
+                            return None
                         raise exc
                 if attempt == max_retries - 1:
-                    if silent:
+                    if default_on_error is not _DEFAULT_NOT_SET:
                         return default_on_error
+                    if silent:
+                        return None
                     raise
-                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
-        return default_on_error
+                backoff = min(2.5, 0.1 * (1.6 ** attempt) + random.uniform(0.05, 0.25))
+                time.sleep(backoff)
+        return default_on_error if default_on_error is not _DEFAULT_NOT_SET else None
 
     def _init_db(self) -> None:
         """Initialize database tables with network-compatible journal mode."""
@@ -250,6 +285,7 @@ class ClusterStorageBus:
             try:
                 conn.execute("PRAGMA journal_mode = TRUNCATE;")
                 conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA temp_store = MEMORY;")
             except Exception:
                 pass
             conn.execute("""
@@ -477,6 +513,10 @@ class ClusterStorageBus:
         """Enable or disable a worker from claiming cluster jobs."""
         val = 1 if enabled else 0
         def _op(conn: sqlite3.Connection) -> None:
+            try:
+                conn.execute("ALTER TABLE workers ADD COLUMN enabled INTEGER DEFAULT 1;")
+            except Exception:
+                pass
             conn.execute(
                 "UPDATE workers SET enabled = ?, status = CASE WHEN ? = 0 THEN 'DISABLED' ELSE 'IDLE' END WHERE worker_id = ?;",
                 (val, val, worker_id),
@@ -486,17 +526,28 @@ class ClusterStorageBus:
                     "UPDATE job_participants SET status = 'DROPPED' WHERE worker_id = ?;",
                     (worker_id,),
                 )
-        self._run_with_retry(_op)
+        try:
+            self._run_with_retry(_op, silent=True)
+        except Exception:
+            pass
 
     def is_worker_enabled(self, worker_id: str) -> bool:
         """Check whether a worker is enabled to claim cluster jobs."""
         def _op(conn: sqlite3.Connection) -> bool:
-            cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
-            row = cursor.fetchone()
-            if row is not None and row[0] is not None:
-                return bool(row[0])
+            try:
+                cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
+                row = cursor.fetchone()
+                if row is not None and row[0] is not None:
+                    return bool(row[0])
+            except sqlite3.OperationalError as oe:
+                if "no such column" in str(oe).lower():
+                    return True
+                raise
             return True
-        return self._run_with_retry(_op, default_on_error=True)
+        try:
+            return self._run_with_retry(_op, default_on_error=True, silent=True)
+        except Exception:
+            return True
 
     def delete_worker(self, worker_id: str) -> bool:
         """Delete a worker record from the database."""

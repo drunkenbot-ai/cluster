@@ -1061,6 +1061,9 @@ def safe_torch_load(
     return torch.load(str(p), map_location=device)
 
 
+_DEFAULT_NOT_SET = object()
+
+
 class StandaloneStorageBus:
     """Self-contained storage bus client operating over central shared network storage."""
 
@@ -1075,11 +1078,13 @@ class StandaloneStorageBus:
     @contextlib.contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         conn = None
-        for attempt in range(5):
+        for attempt in range(8):
             try:
-                conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level="DEFERRED")
+                conn = sqlite3.connect(str(self.db_path), timeout=30.0, isolation_level="DEFERRED")
                 conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute("PRAGMA busy_timeout = 30000;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA temp_store = MEMORY;")
                 break
             except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
                 err_msg = str(exc).lower()
@@ -1089,9 +1094,9 @@ class StandaloneStorageBus:
                         continue
                     except Exception:
                         pass
-                if attempt == 4:
+                if attempt == 7:
                     raise
-                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
+                time.sleep(min(2.0, 0.05 * (1.6 ** attempt) + random.uniform(0.03, 0.15)))
         try:
             yield conn
             if conn and conn.in_transaction:
@@ -1118,6 +1123,7 @@ class StandaloneStorageBus:
         corrupt_backup = self.shared_dir / f"cluster.db.corrupt_{ts}"
         salvaged_data: dict[str, list[dict[str, Any]]] = {}
 
+        conn_old = None
         try:
             conn_old = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0)
             conn_old.row_factory = sqlite3.Row
@@ -1127,13 +1133,37 @@ class StandaloneStorageBus:
                     salvaged_data[tbl] = [dict(r) for r in cursor.fetchall()]
                 except Exception:
                     pass
-            conn_old.close()
         except Exception:
             pass
+        finally:
+            if conn_old is not None:
+                try:
+                    conn_old.close()
+                except Exception:
+                    pass
+                del conn_old
+            import gc
+            gc.collect()
 
         try:
             if self.db_path.exists():
-                shutil.move(str(self.db_path), str(corrupt_backup))
+                moved = False
+                for _ in range(5):
+                    try:
+                        shutil.move(str(self.db_path), str(corrupt_backup))
+                        moved = True
+                        break
+                    except Exception:
+                        import gc
+                        gc.collect()
+                        time.sleep(0.1)
+                if not moved:
+                    try:
+                        shutil.copy2(str(self.db_path), str(corrupt_backup))
+                        self.db_path.unlink(missing_ok=True)
+                    except Exception as fallback_err:
+                        print(f"[StandaloneStorageBus] Could not archive corrupt database: {fallback_err}")
+                        return False
             for ext in ["-journal", "-wal", "-shm"]:
                 j_file = self.shared_dir / f"cluster.db{ext}"
                 if j_file.exists():
@@ -1175,8 +1205,8 @@ class StandaloneStorageBus:
     def _run_with_retry(
         self,
         fn: Callable[[sqlite3.Connection], Any],
-        max_retries: int = 5,
-        default_on_error: Any = None,
+        max_retries: int = 10,
+        default_on_error: Any = _DEFAULT_NOT_SET,
         silent: bool = False,
     ) -> Any:
         """Execute a database function with automatic retry on SQLite operational/locking errors."""
@@ -1195,21 +1225,27 @@ class StandaloneStorageBus:
                                 return fn(conn)
                     except Exception as rec_err:
                         print(f"[StandaloneStorageBus] Database self-healing retry failed: {rec_err}")
-                        if silent:
+                        if default_on_error is not _DEFAULT_NOT_SET:
                             return default_on_error
+                        if silent:
+                            return None
                         raise exc
                 if attempt == max_retries - 1:
-                    if silent:
+                    if default_on_error is not _DEFAULT_NOT_SET:
                         return default_on_error
+                    if silent:
+                        return None
                     raise
-                time.sleep(0.05 * (2 ** attempt) + random.uniform(0.02, 0.08))
-        return default_on_error
+                backoff = min(2.5, 0.1 * (1.6 ** attempt) + random.uniform(0.05, 0.25))
+                time.sleep(backoff)
+        return default_on_error if default_on_error is not _DEFAULT_NOT_SET else None
 
     def _init_db(self) -> None:
         def _init(conn: sqlite3.Connection) -> None:
             try:
                 conn.execute("PRAGMA journal_mode = TRUNCATE;")
                 conn.execute("PRAGMA synchronous = NORMAL;")
+                conn.execute("PRAGMA temp_store = MEMORY;")
             except Exception:
                 pass
             conn.execute("""
@@ -1468,6 +1504,10 @@ class StandaloneStorageBus:
         """Enable or disable a worker from claiming cluster jobs."""
         val = 1 if enabled else 0
         def _op(conn: sqlite3.Connection) -> None:
+            try:
+                conn.execute("ALTER TABLE workers ADD COLUMN enabled INTEGER DEFAULT 1;")
+            except Exception:
+                pass
             conn.execute(
                 "UPDATE workers SET enabled = ?, status = CASE WHEN ? = 0 THEN 'DISABLED' ELSE 'IDLE' END WHERE worker_id = ?;",
                 (val, val, worker_id),
@@ -1477,17 +1517,28 @@ class StandaloneStorageBus:
                     "UPDATE job_participants SET status = 'DROPPED' WHERE worker_id = ?;",
                     (worker_id,),
                 )
-        self._run_with_retry(_op)
+        try:
+            self._run_with_retry(_op, silent=True)
+        except Exception:
+            pass
 
     def is_worker_enabled(self, worker_id: str) -> bool:
         """Check whether a worker is enabled to claim cluster jobs."""
         def _op(conn: sqlite3.Connection) -> bool:
-            cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
-            row = cursor.fetchone()
-            if row is not None and row[0] is not None:
-                return bool(row[0])
+            try:
+                cursor = conn.execute("SELECT enabled FROM workers WHERE worker_id = ?;", (worker_id,))
+                row = cursor.fetchone()
+                if row is not None and row[0] is not None:
+                    return bool(row[0])
+            except sqlite3.OperationalError as oe:
+                if "no such column" in str(oe).lower():
+                    return True
+                raise
             return True
-        return self._run_with_retry(_op, default_on_error=True)
+        try:
+            return self._run_with_retry(_op, default_on_error=True, silent=True)
+        except Exception:
+            return True
 
     def get_worker_shard_assignment(self, job_id: str, worker_id: str, round_num: int = 0) -> tuple[int, int]:
         def _op(conn: sqlite3.Connection) -> tuple[int, int]:
@@ -2280,8 +2331,11 @@ class StandaloneWorker:
             pass
 
     def _heartbeat(self, status: Optional[str] = None, current_job_id: Optional[str] = None) -> None:
-        metrics = collect_system_metrics(self.device_str, self.vram_gb)
-        self.bus.heartbeat(self.worker_id, status=status, current_job_id=current_job_id, metrics=metrics)
+        try:
+            metrics = collect_system_metrics(self.device_str, self.vram_gb)
+            self.bus.heartbeat(self.worker_id, status=status, current_job_id=current_job_id, metrics=metrics)
+        except Exception:
+            pass
 
     def _restart_process(self) -> None:
         """Cleanly respawn this worker process and exit."""
@@ -2373,15 +2427,24 @@ class StandaloneWorker:
 
         while True:
             try:
-                cmd = self.bus.get_worker_command(self.worker_id)
+                try:
+                    cmd = self.bus.get_worker_command(self.worker_id)
+                except Exception:
+                    cmd = None
                 if cmd == "STOP":
                     self.log("Received STOP command. Setting status to IDLE and waiting for job...")
-                    self.bus.set_worker_command(self.worker_id, None)
+                    try:
+                        self.bus.set_worker_command(self.worker_id, None)
+                    except Exception:
+                        pass
                     self._abort_active_job = True
                     self._heartbeat(status="IDLE", current_job_id=None)
                 elif cmd == "SHUTDOWN":
                     self.log("Received SHUTDOWN command. Shutting down worker process...")
-                    self.bus.set_worker_command(self.worker_id, None)
+                    try:
+                        self.bus.set_worker_command(self.worker_id, None)
+                    except Exception:
+                        pass
                     self._heartbeat(status="OFFLINE", current_job_id=None)
                     release_singleton_lock(self.device_tag)
                     release_singleton_lock(f"wid_{self.worker_id}")
@@ -2391,18 +2454,30 @@ class StandaloneWorker:
                     self._restart_process()
 
                 # Check if worker is disabled by operator: remain active and heartbeating, but do not claim jobs
-                if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+                try:
+                    is_enabled = getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id)
+                except Exception:
+                    is_enabled = True
+
+                if not is_enabled:
                     self._heartbeat(status="DISABLED", current_job_id=None)
                     time.sleep(poll_interval)
                     continue
 
                 self._heartbeat(status="IDLE", current_job_id=None)
-                active_job = self.bus.get_active_job()
+                try:
+                    active_job = self.bus.get_active_job()
+                except Exception:
+                    active_job = None
 
                 if active_job:
                     status = active_job.get("status")
                     jid = active_job.get("job_id", "")
-                    if status == "RUNNING" and not self.bus.is_stopped(jid):
+                    try:
+                        is_job_stopped = self.bus.is_stopped(jid)
+                    except Exception:
+                        is_job_stopped = False
+                    if status == "RUNNING" and not is_job_stopped:
                         is_compat, reason = self.is_job_compatible(active_job)
                         if not is_compat:
                             if not hasattr(self, "_incompat_reported"):
@@ -2422,7 +2497,11 @@ class StandaloneWorker:
 
     def is_job_compatible(self, job: dict[str, Any]) -> tuple[bool, str]:
         """Check if this worker node and device are compatible with the requested job."""
-        if not getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id):
+        try:
+            is_enabled = getattr(self.bus, "is_worker_enabled", lambda wid: True)(self.worker_id)
+        except Exception:
+            is_enabled = True
+        if not is_enabled:
             return False, f"Worker '{self.worker_id}' is disabled by operator."
 
         if getattr(self, "_current_status", "") == "DEGRADED":
@@ -2688,19 +2767,32 @@ class StandaloneWorker:
 
         try:
             while cur_round < max_rounds:
-                if self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
+                try:
+                    stopped = self.bus.is_stopped(job_id)
+                except Exception:
+                    stopped = False
+                if stopped or getattr(self, "_abort_active_job", False):
                     self.log(f"Job {job_id} stopped. Returning to IDLE.")
                     break
 
-                cmd = self.bus.get_worker_command(self.worker_id)
+                try:
+                    cmd = self.bus.get_worker_command(self.worker_id)
+                except Exception:
+                    cmd = None
                 if cmd == "STOP":
                     self.log(f"Received STOP command during job {job_id}. Aborting job and returning to IDLE...")
-                    self.bus.set_worker_command(self.worker_id, None)
+                    try:
+                        self.bus.set_worker_command(self.worker_id, None)
+                    except Exception:
+                        pass
                     self._abort_active_job = True
                     break
                 elif cmd == "SHUTDOWN":
                     self.log(f"Received SHUTDOWN command during job {job_id}. Shutting down worker...")
-                    self.bus.set_worker_command(self.worker_id, None)
+                    try:
+                        self.bus.set_worker_command(self.worker_id, None)
+                    except Exception:
+                        pass
                     self._heartbeat(status="OFFLINE", current_job_id=None)
                     release_singleton_lock(self.device_tag)
                     release_singleton_lock(f"wid_{self.worker_id}")
@@ -2710,27 +2802,42 @@ class StandaloneWorker:
                     self._restart_process()
 
                 # Handle cooperative pause
-                while self.bus.is_paused(job_id):
+                while True:
+                    try:
+                        paused = self.bus.is_paused(job_id)
+                    except Exception:
+                        paused = False
+                    if not paused:
+                        break
                     self._heartbeat(status="PAUSED", current_job_id=job_id)
                     time.sleep(1.0)
-                    if self.bus.is_stopped(job_id):
-                        break
+                    try:
+                        if self.bus.is_stopped(job_id):
+                            break
+                    except Exception:
+                        pass
 
                 # Dynamic shard reassignment: verify active worker pool and take over dropped worker slots
-                new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
-                if new_shard_idx != shard_idx or new_total_shards != total_shards:
-                    self.log(f"Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
-                    shard_idx, total_shards = new_shard_idx, new_total_shards
-                    dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
-                    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-                    dataloader_iter = iter(dataloader)
+                try:
+                    new_shard_idx, new_total_shards = self.bus.get_worker_shard_assignment(job_id, self.worker_id, cur_round)
+                    if new_shard_idx != shard_idx or new_total_shards != total_shards:
+                        self.log(f"Active workers changed. Reallocating shard {new_shard_idx + 1}/{new_total_shards} for round {cur_round}.")
+                        shard_idx, total_shards = new_shard_idx, new_total_shards
+                        dataset = StandaloneTokenDataset(token_array, context_length, shard_idx, total_shards, vocab_size=vocab_size)
+                        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                        dataloader_iter = iter(dataloader)
+                except Exception as shard_err:
+                    self.log(f"Notice: Shard check deferred due to busy database ({shard_err}). Retaining shard {shard_idx + 1}/{total_shards}.", level="WARNING")
 
                 # Sync from global model if round > 0
                 if cur_round > 0:
                     self.log(f"Waiting for global averaged model round {cur_round - 1}...")
                     while not self.bus.is_global_weights_ready(job_id, cur_round - 1):
-                        if self.bus.is_stopped(job_id):
-                            return
+                        try:
+                            if self.bus.is_stopped(job_id):
+                                return
+                        except Exception:
+                            pass
                         self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
                         time.sleep(poll_interval)
 
@@ -2766,25 +2873,38 @@ class StandaloneWorker:
                 step_losses = []
                 for step_idx in range(sync_steps):
                     if step_idx % 5 == 0:
-                        cmd = self.bus.get_worker_command(self.worker_id)
-                        if cmd == "STOP":
-                            self.log("Received STOP command during training. Aborting job and returning to IDLE...")
-                            self.bus.set_worker_command(self.worker_id, None)
-                            self._abort_active_job = True
-                            return
-                        elif cmd == "SHUTDOWN":
-                            self.log("Received SHUTDOWN command during training. Shutting down...")
-                            self.bus.set_worker_command(self.worker_id, None)
-                            self._heartbeat(status="OFFLINE", current_job_id=None)
-                            release_singleton_lock(self.device_tag)
-                            release_singleton_lock(f"wid_{self.worker_id}")
-                            os._exit(0)
-                        elif cmd == "RESTART":
-                            self.log("Received RESTART command during training. Restarting process...")
-                            self._restart_process()
+                        try:
+                            cmd = self.bus.get_worker_command(self.worker_id)
+                            if cmd == "STOP":
+                                self.log("Received STOP command during training. Aborting job and returning to IDLE...")
+                                try:
+                                    self.bus.set_worker_command(self.worker_id, None)
+                                except Exception:
+                                    pass
+                                self._abort_active_job = True
+                                return
+                            elif cmd == "SHUTDOWN":
+                                self.log("Received SHUTDOWN command during training. Shutting down...")
+                                try:
+                                    self.bus.set_worker_command(self.worker_id, None)
+                                except Exception:
+                                    pass
+                                self._heartbeat(status="OFFLINE", current_job_id=None)
+                                release_singleton_lock(self.device_tag)
+                                release_singleton_lock(f"wid_{self.worker_id}")
+                                os._exit(0)
+                            elif cmd == "RESTART":
+                                self.log("Received RESTART command during training. Restarting process...")
+                                self._restart_process()
+                        except Exception:
+                            pass
                     if step_idx % 20 == 0:
                         self._heartbeat(status="TRAINING", current_job_id=job_id)
-                    if self.bus.is_stopped(job_id) or getattr(self, "_abort_active_job", False):
+                    try:
+                        stopped = self.bus.is_stopped(job_id)
+                    except Exception:
+                        stopped = False
+                    if stopped or getattr(self, "_abort_active_job", False):
                         self.log(f"Job {job_id} stopped. Aborting training loop.")
                         return
                     try:
@@ -2878,30 +2998,36 @@ class StandaloneWorker:
                 )
 
                 # Save local telemetry
-                self.bus.save_worker_telemetry(
-                    job_id=job_id,
-                    round_num=cur_round,
-                    worker_id=self.worker_id,
-                    telemetry={
-                        "worker_id": self.worker_id,
-                        "round": cur_round,
-                        "steps_completed": sync_steps,
-                        "avg_loss": round(avg_loss, 4),
-                        "val_loss": round(val_loss, 4) if val_loss is not None else None,
-                        "compute_sec": round(elapsed, 2),
-                        "tokens_processed": tokens_processed,
-                        "tokens_per_sec": round(tokens_per_sec, 1),
-                        "timestamp": time.time(),
-                    },
-                )
+                try:
+                    self.bus.save_worker_telemetry(
+                        job_id=job_id,
+                        round_num=cur_round,
+                        worker_id=self.worker_id,
+                        telemetry={
+                            "worker_id": self.worker_id,
+                            "round": cur_round,
+                            "steps_completed": sync_steps,
+                            "avg_loss": round(avg_loss, 4),
+                            "val_loss": round(val_loss, 4) if val_loss is not None else None,
+                            "compute_sec": round(elapsed, 2),
+                            "tokens_processed": tokens_processed,
+                            "tokens_per_sec": round(tokens_per_sec, 1),
+                            "timestamp": time.time(),
+                        },
+                    )
+                except Exception as t_err:
+                    self.log(f"Notice: Failed to save round telemetry ({t_err}).", level="WARNING")
 
                 # Wait for coordinator to publish global model
                 t_sync_start = time.time()
                 last_log_wait = t_sync_start
                 self.log(f"Deposited weights for round {cur_round}. Waiting for coordinator synchronization...")
                 while not self.bus.is_global_weights_ready(job_id, cur_round):
-                    if self.bus.is_stopped(job_id):
-                        return
+                    try:
+                        if self.bus.is_stopped(job_id):
+                            return
+                    except Exception:
+                        pass
                     self._heartbeat(status="SYNC_WAIT", current_job_id=job_id)
 
                     now_wait = time.time()
@@ -2910,24 +3036,24 @@ class StandaloneWorker:
                         last_log_wait = now_wait
                         self.log(f"Waiting for round {cur_round} global weights ({elapsed_sync:.0f}s elapsed)...")
 
-                        # Autonomous fallback: if waiting > 45s and coordinator is inactive or this is the sole node
-                        job_info = self.bus.get_job(job_id) or {}
-                        job_updated = float(job_info.get("updated_at") or 0.0)
-                        coord_unresponsive = (now_wait - job_updated) > 60.0
-                        active_parts = self.bus.get_job_participants(job_id)
-                        sole_worker = (len(active_parts) <= 1) or all(p.get("worker_id") == self.worker_id for p in active_parts)
+                        try:
+                            # Autonomous fallback: if waiting > 45s and coordinator is inactive or this is the sole node
+                            job_info = self.bus.get_job(job_id) or {}
+                            job_updated = float(job_info.get("updated_at") or 0.0)
+                            coord_unresponsive = (now_wait - job_updated) > 60.0
+                            active_parts = self.bus.get_job_participants(job_id)
+                            sole_worker = (len(active_parts) <= 1) or all(p.get("worker_id") == self.worker_id for p in active_parts)
 
-                        if elapsed_sync > 45.0 and (sole_worker or coord_unresponsive):
-                            self.log(
-                                f"Autonomous sync: Coordinator is inactive or sole node detected ({len(active_parts)} active). "
-                                f"Triggering local round {cur_round} aggregation..."
-                            )
-                            try:
+                            if elapsed_sync > 45.0 and (sole_worker or coord_unresponsive):
+                                self.log(
+                                    f"Autonomous sync: Coordinator is inactive or sole node detected ({len(active_parts)} active). "
+                                    f"Triggering local round {cur_round} aggregation..."
+                                )
                                 from cluster.coordinator import ClusterCoordinator
                                 coord = ClusterCoordinator(self.bus, job_id)
                                 coord.wait_and_average_round(round_num=cur_round, poll_interval_seconds=0.5)
-                            except Exception as c_err:
-                                self.log(f"Autonomous aggregation notice: {c_err}")
+                        except Exception as c_err:
+                            self.log(f"Autonomous aggregation notice: {c_err}")
 
                     time.sleep(poll_interval)
 
