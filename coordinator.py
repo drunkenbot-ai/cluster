@@ -82,6 +82,7 @@ class ClusterCoordinator:
         round_num: int,
         poll_interval_seconds: float = 2.0,
         progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        stop_event: Optional[threading.Event] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Wait for worker checkpoints and publish the averaged global model.
 
@@ -91,6 +92,7 @@ class ClusterCoordinator:
             round_num: Current synchronization round index.
             poll_interval_seconds: Polling sleep interval.
             progress_callback: Optional progress reporter.
+            stop_event: Optional threading.Event to abort wait immediately.
 
         Returns:
             Averaged state dict, or None if the job was stopped.
@@ -109,15 +111,15 @@ class ClusterCoordinator:
         participants: list[dict[str, Any]] = []
 
         while True:
+            # Check for stop signal immediately
+            if (stop_event and stop_event.is_set()) or self.bus.is_stopped(self.job_id):
+                return None
+
             now_loop = time.time()
             # Signal coordinator liveness periodically (every 5.0s) rather than every sub-second loop
             if hasattr(self.bus, "touch_job") and (now_loop - last_touch >= 5.0):
                 self.bus.touch_job(self.job_id)
                 last_touch = now_loop
-
-            # Check for stop signal
-            if self.bus.is_stopped(self.job_id):
-                return None
 
             ready_workers = self.bus.get_ready_workers_for_round(self.job_id, round_num)
 
@@ -171,7 +173,11 @@ class ClusterCoordinator:
             if (all_ready or timeout_expired) and ready_workers:
                 break
 
-            time.sleep(poll_interval_seconds)
+            if stop_event:
+                if stop_event.wait(timeout=poll_interval_seconds):
+                    return None
+            else:
+                time.sleep(poll_interval_seconds)
 
         # Fault tolerance: if any worker failed to deposit weights (straggler / crashed),
         # mark it as DROPPED so remaining active workers re-index and take over its shard.
@@ -525,16 +531,21 @@ class ClusterCoordinator:
             if self.bus.is_stopped(self.job_id):
                 break
             while self.bus.is_paused(self.job_id):
-                if stop_event and stop_event.is_set() or self.bus.is_stopped(self.job_id):
+                if (stop_event and stop_event.is_set()) or self.bus.is_stopped(self.job_id):
                     break
-                time.sleep(poll_interval_seconds)
-            if stop_event and stop_event.is_set() or self.bus.is_stopped(self.job_id):
+                if stop_event:
+                    if stop_event.wait(timeout=poll_interval_seconds):
+                        break
+                else:
+                    time.sleep(poll_interval_seconds)
+            if (stop_event and stop_event.is_set()) or self.bus.is_stopped(self.job_id):
                 break
 
             state = self.wait_and_average_round(
                 round_num=cur_round,
                 poll_interval_seconds=poll_interval_seconds,
                 progress_callback=telemetry_callback,
+                stop_event=stop_event,
             )
             if state is None:
                 break
