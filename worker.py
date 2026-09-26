@@ -1387,9 +1387,19 @@ class ClusterWorker:
                 warmup_steps = int(t_cfg.get("warmup_steps", max(10, total_steps // 20)))
                 warmup_steps = min(warmup_steps, max(total_steps - 1, 1))
                 min_ratio = float(t_cfg.get("scheduler_min_lr_ratio", 0.1))
+                annealing_steps = int(t_cfg.get("annealing_steps", 0))
                 global_step = round_num * steps_per_round + step
                 if global_step < warmup_steps:
                     lr_mult = max(global_step + 1, 1) / max(warmup_steps, 1)
+                elif annealing_steps > 0 and global_step >= (total_steps - annealing_steps):
+                    # Frontier curriculum annealing cooldown
+                    anneal_prog = (global_step - (total_steps - annealing_steps)) / max(annealing_steps, 1)
+                    anneal_prog = max(0.0, min(anneal_prog, 1.0))
+                    start_anneal_step = total_steps - annealing_steps
+                    base_prog = (start_anneal_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+                    base_prog = max(0.0, min(base_prog, 1.0))
+                    start_lr_mult = min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * base_prog))
+                    lr_mult = min_ratio + (start_lr_mult - min_ratio) * (1.0 - anneal_prog)
                 else:
                     prog = (global_step - warmup_steps) / max(total_steps - warmup_steps, 1)
                     prog = max(0.0, min(prog, 1.0))
