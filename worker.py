@@ -1008,7 +1008,8 @@ class ClusterWorker:
             repo_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
             if (repo_dir / ".git").exists():
                 self.log("Pulling latest cluster repository changes before respawning...")
-                subprocess.run(["git", "pull", "--ff-only"], cwd=str(repo_dir), timeout=15, capture_output=True)
+                pull_flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+                subprocess.run(["git", "pull", "--ff-only"], cwd=str(repo_dir), timeout=15, capture_output=True, creationflags=pull_flags)
         except Exception:
             pass
 
@@ -1019,19 +1020,25 @@ class ClusterWorker:
             allow_shared_device=self.allow_shared_device,
         )
         flags = 0
+        startupinfo = None
         if sys.platform == "win32":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
             CREATE_NO_WINDOW = 0x08000000
             flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE (prevents Windows Terminal / conhost flashing)
         log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
         log_file = open(log_path, "a", encoding="utf-8")
         try:
             proc = subprocess.Popen(
                 cmd_args,
+                stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=flags,
+                startupinfo=startupinfo,
                 close_fds=True,
             )
             self.log(f"Successfully respawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
@@ -1284,17 +1291,27 @@ class ClusterWorker:
                 if ":" in self.device_str:
                     dev_idx = int(self.device_str.split(":")[1])
                 _, tot_bytes = torch.cuda.mem_get_info(dev_idx)
-                tot_gb = tot_bytes / (1024 ** 3)
             except Exception:
                 tot_gb = 16.0
-            if tot_gb <= 12.0:
-                max_safe_tokens = 4096
-            elif tot_gb >= 15.0 and should_checkpoint:
-                # With activation checkpointing enabled on 16GB+ cards, micro-batches of up to 16,384 tokens
-                # safely utilize ~8-10 GB (50-65% VRAM), accelerating single-worker throughput without risking OOM
-                max_safe_tokens = 16384
+
+            # Scale max_safe_tokens to target 85-90% VRAM utilization while capping
+            # per-kernel execution to prevent Windows WDDM driver watchdog (TDR) timeouts
+            if tot_gb < 8.5:
+                # 8 GB GPUs: target ~6.8 GB (85%)
+                max_safe_tokens = 16384 if should_checkpoint else 8192
+            elif tot_gb <= 13.0:
+                # 12 GB GPUs: target ~10.2 GB (85%)
+                max_safe_tokens = 32768 if should_checkpoint else 16384
+            elif tot_gb <= 18.0:
+                # 16 GB GPUs: target ~13.8 GB (86-88%)
+                max_safe_tokens = 49152 if should_checkpoint else 24576
+            elif tot_gb <= 26.0:
+                # 24 GB GPUs: target ~20.5 GB (85-88%)
+                max_safe_tokens = 65536 if should_checkpoint else 32768
             else:
-                max_safe_tokens = 8192
+                # 32GB+ datacenter GPUs
+                max_safe_tokens = 98304 if should_checkpoint else 49152
+
             safe_micro_bs = max(1, max_safe_tokens // max(ctx_len, 1)) if ctx_len > 0 else 4
         else:
             safe_micro_bs = 999999

@@ -2387,7 +2387,8 @@ class StandaloneWorker:
             root_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
             if (root_dir / ".git").exists():
                 self.log("Pulling latest cluster repository changes before respawning...")
-                subprocess.run(["git", "pull", "--ff-only"], cwd=str(root_dir), timeout=15, capture_output=True)
+                pull_flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+                subprocess.run(["git", "pull", "--ff-only"], cwd=str(root_dir), timeout=15, capture_output=True, creationflags=pull_flags)
         except Exception:
             pass
 
@@ -2399,11 +2400,15 @@ class StandaloneWorker:
         )
         try:
             flags = 0
+            startupinfo = None
             if sys.platform == "win32":
                 DETACHED_PROCESS = 0x00000008
                 CREATE_NEW_PROCESS_GROUP = 0x00000200
                 CREATE_NO_WINDOW = 0x08000000
                 flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE (prevents Windows Terminal / conhost flashing)
             log_dir = Path(self.bus.shared_dir) / "logs"
             try:
                 log_dir.mkdir(parents=True, exist_ok=True)
@@ -2419,6 +2424,7 @@ class StandaloneWorker:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 creationflags=flags,
+                startupinfo=startupinfo,
                 close_fds=True,
             )
             self.log(f"Successfully spawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
@@ -2994,6 +3000,7 @@ class StandaloneWorker:
                 self._heartbeat(status="TRAINING", current_job_id=job_id)
 
                 grad_accum = max(1, int(training_cfg.get("gradient_accumulation", 1) or 1))
+                should_checkpoint = bool(training_cfg.get("activation_checkpointing", False) or context_length >= 1024)
                 if is_cuda:
                     try:
                         dev_idx = 0
@@ -3003,7 +3010,20 @@ class StandaloneWorker:
                         tot_gb = tot_bytes / (1024 ** 3)
                     except Exception:
                         tot_gb = 16.0
-                    max_safe_tokens = 4096 if tot_gb <= 12.0 else 8192
+
+                    # Scale max_safe_tokens to target 85-90% VRAM utilization while capping
+                    # per-kernel execution to prevent Windows WDDM driver watchdog (TDR) timeouts
+                    if tot_gb < 8.5:
+                        max_safe_tokens = 16384 if should_checkpoint else 8192
+                    elif tot_gb <= 13.0:
+                        max_safe_tokens = 32768 if should_checkpoint else 16384
+                    elif tot_gb <= 18.0:
+                        max_safe_tokens = 49152 if should_checkpoint else 24576
+                    elif tot_gb <= 26.0:
+                        max_safe_tokens = 65536 if should_checkpoint else 32768
+                    else:
+                        max_safe_tokens = 98304 if should_checkpoint else 49152
+
                     safe_micro_bs = max(1, max_safe_tokens // max(context_length, 1)) if context_length > 0 else 4
                 else:
                     safe_micro_bs = 999999
