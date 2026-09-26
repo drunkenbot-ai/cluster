@@ -1291,6 +1291,7 @@ class ClusterWorker:
                 if ":" in self.device_str:
                     dev_idx = int(self.device_str.split(":")[1])
                 _, tot_bytes = torch.cuda.mem_get_info(dev_idx)
+                tot_gb = tot_bytes / (1024 ** 3)
             except Exception:
                 tot_gb = 16.0
 
