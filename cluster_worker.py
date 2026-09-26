@@ -552,6 +552,26 @@ import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from torch.utils.data import DataLoader, Dataset  # noqa: E402
 
+if torch.cuda.is_available():
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+
+
+def is_hardware_bf16_supported(device_str: str = "cuda:0") -> bool:
+    """Check whether the device has native hardware Bfloat16 Tensor Core execution (compute capability >= 8.0)."""
+    if not torch.cuda.is_available() or not str(device_str).startswith("cuda"):
+        return False
+    try:
+        dev_idx = int(str(device_str).split(":")[1]) if ":" in str(device_str) else 0
+        cap = torch.cuda.get_device_capability(dev_idx)
+        return cap[0] >= 8 and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+    except Exception:
+        return False
+
 
 # =============================================================================
 # 2. Per-Device Singleton Process Management
@@ -1983,7 +2003,10 @@ class StandaloneCausalSelfAttention(nn.Module):
             v = v[:, :, None, :, :].expand(b, self.kv_head_count, rep, t, self.head_size).reshape(b, self.head_count, t, self.head_size)
 
         if hasattr(F, "scaled_dot_product_attention"):
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0)
+            q_sdpa = q.contiguous()
+            k_sdpa = k.contiguous()
+            v_sdpa = v.contiguous()
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0)
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
             att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
@@ -2522,6 +2545,14 @@ class StandaloneWorker:
                 _ = (test_t + 1.0).sum().item()
                 del test_t
             except Exception as exc:
+                err_msg = str(exc)
+                if any(s in err_msg.lower() for s in ("cuda error", "device-side assert", "illegal memory access")):
+                    self.log(
+                        f"CUDA device '{self.device_str}' kernel execution test failed due to corrupted CUDA context ({exc}). "
+                        "Respawning fresh worker process to self-heal...",
+                        level="WARNING",
+                    )
+                    self._restart_process()
                 return False, f"CUDA device '{self.device_str}' failed kernel execution test: {exc}"
 
         tcfg = job.get("training_config", {})
@@ -2532,9 +2563,9 @@ class StandaloneWorker:
                 tcfg = {}
         prec = str(tcfg.get("precision", "float32")).lower()
         if prec in {"bfloat16", "bf16"} and self.device_str.startswith("cuda"):
-            import torch
-            if not (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()):
-                return False, f"Device '{self.device_str}' does not natively support bfloat16 precision."
+            if not is_hardware_bf16_supported(self.device_str):
+                # Device lacks native hardware BF16 tensor cores; training will safely adapt to FP16 with GradScaler
+                pass
 
         dataset_path = job.get("dataset_path", "")
         if not dataset_path:
@@ -2758,7 +2789,19 @@ class StandaloneWorker:
         precision = str(training_cfg.get("precision", "fp16")).lower()
         use_amp = bool(training_cfg.get("use_amp", True))
         amp_enabled = is_cuda and use_amp and (precision in ("fp16", "bf16"))
-        amp_dtype = torch.bfloat16 if (precision == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
+        if amp_enabled and precision == "bf16":
+            if is_hardware_bf16_supported(self.device_str):
+                amp_dtype = torch.bfloat16
+            else:
+                self.log(
+                    f"Notice: Compute device '{self.device_str}' ({getattr(self, 'gpu_name', 'GPU')}) lacks native hardware Bfloat16 tensor cores. "
+                    "Safely using FP16 with GradScaler for numerical stability and kernel safety.",
+                    level="INFO",
+                )
+                amp_dtype = torch.float16
+        else:
+            amp_dtype = torch.float16
+
         scaler = None
         if amp_enabled and amp_dtype == torch.float16:
             if not hasattr(self, "_scaler") or self._scaler is None:
@@ -2917,7 +2960,7 @@ class StandaloneWorker:
                     batch_sz = x.size(0)
                     tokens_processed += int(x.numel())
                     x = torch.clamp(x, 0, vocab_size - 1)
-                    y = torch.clamp(y, 0, vocab_size - 1)
+                    y = torch.where(y == -100, y, torch.clamp(y, 0, vocab_size - 1))
 
                     micro_bs = max(1, min(batch_sz, safe_micro_bs))
                     num_micros = math.ceil(batch_sz / micro_bs)
@@ -2927,10 +2970,15 @@ class StandaloneWorker:
                     for m_idx in range(0, batch_sz, micro_bs):
                         x_m = x[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
                         y_m = y[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
+                        x_m = torch.clamp(x_m, 0, vocab_size - 1)
 
                         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                             logits = model(x_m)
-                            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_m.view(-1))
+                            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+                            num_classes = logits.size(-1)
+                            y_m_safe = torch.where(y_m == -100, y_m, torch.clamp(y_m, 0, num_classes - 1))
+                            loss = F.cross_entropy(logits.view(-1, num_classes), y_m_safe.view(-1), ignore_index=-100)
                             scaled_loss = loss / effective_accum
 
                         if scaler is not None:
@@ -3078,6 +3126,14 @@ class StandaloneWorker:
             tb = traceback.format_exc()
             self.log(f"Training failed for job {job_id}:\n{tb}", level="ERROR")
             self._heartbeat(status="ERROR", current_job_id=job_id)
+            err_lower = (str(exc) + " " + tb).lower()
+            if any(s in err_lower for s in ("cuda error", "device-side assert", "illegal memory access", "out of memory")):
+                if self.device_str.startswith("cuda"):
+                    self.log(
+                        "Fatal CUDA context corruption / error detected. Respawning fresh worker process with clean GPU context...",
+                        level="WARNING",
+                    )
+                    self._restart_process()
             return
         finally:
             # Explicitly free model weights, optimizer states, and CUDA memory

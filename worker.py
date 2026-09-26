@@ -33,6 +33,19 @@ from torch.utils.data import DataLoader
 from .bus import ClusterStorageBus
 from .sharding import ShardedTokenDataset
 
+# Ensure parent repository root is in sys.path so engine and inference packages can always be imported
+repo_root = Path(__file__).resolve().parent.parent
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+if torch.cuda.is_available():
+    try:
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        pass
+
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -405,6 +418,36 @@ def get_hardware_info(device_preference: Optional[str] = None) -> tuple[str, str
     return device_str, gpu_name, vram_gb
 
 
+def is_hardware_bf16_supported(device_str: str = "cuda:0") -> bool:
+    """Check whether the device has native hardware Bfloat16 Tensor Core execution (compute capability >= 8.0)."""
+    if not torch.cuda.is_available() or not str(device_str).startswith("cuda"):
+        return False
+    try:
+        dev_idx = int(str(device_str).split(":")[1]) if ":" in str(device_str) else 0
+        cap = torch.cuda.get_device_capability(dev_idx)
+        # Ampere (sm_80), Ada Lovelace (sm_89), Hopper (sm_90)+ have native BF16 tensor cores.
+        # Turing (sm_75), Volta (sm_70), Pascal (sm_61) lack hardware BF16 tensor cores.
+        return cap[0] >= 8 and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+    except Exception:
+        return False
+
+
+def get_model_vocab_size(model: nn.Module) -> Optional[int]:
+    """Inspect model to extract true vocabulary size for input/target bounds checking."""
+    cfg = getattr(model, "config", None)
+    if cfg is not None and getattr(cfg, "vocab_size", None):
+        return int(cfg.vocab_size)
+    tok_emb = getattr(model, "token_embedding", None) or getattr(model, "tok_embed", None)
+    if tok_emb is not None and hasattr(tok_emb, "num_embeddings"):
+        return int(tok_emb.num_embeddings)
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is not None and hasattr(lm_head, "out_features"):
+        return int(lm_head.out_features)
+    if hasattr(model, "module"):
+        return get_model_vocab_size(model.module)
+    return None
+
+
 def collect_system_metrics(device_str: str = "cpu", total_vram_gb: float = 0.0) -> dict[str, Any]:
     """Collect current real-time CPU, RAM, and GPU VRAM usage."""
     metrics: dict[str, Any] = {
@@ -468,6 +511,197 @@ def collect_system_metrics(device_str: str = "cpu", total_vram_gb: float = 0.0) 
     return metrics
 
 
+# =============================================================================
+# Standalone MicroGPT Architecture Parity (Zero-dependency Fallback)
+# =============================================================================
+
+class StandaloneRotaryEmbedding(nn.Module):
+    def __init__(self, head_size: int, context_length: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2).float() / head_size))
+        positions = torch.arange(context_length, dtype=torch.float)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos", emb.cos()[None, None, :, :], persistent=False)
+        self.register_buffer("sin", emb.sin()[None, None, :, :], persistent=False)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+        token_count = query.size(-2)
+        cos = self.cos[:, :, start_pos : start_pos + token_count, :]
+        sin = self.sin[:, :, start_pos : start_pos + token_count, :]
+        q_rot = (query * cos) + (self._rotate_half(query) * sin)
+        k_rot = (key * cos) + (self._rotate_half(key) * sin)
+        return q_rot, k_rot
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        first, second = x.chunk(2, dim=-1)
+        return torch.cat((-second, first), dim=-1)
+
+
+class StandaloneRMSNorm(nn.Module):
+    def __init__(self, size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.pow(2).mean(-1, keepdim=True)
+        return x * torch.rsqrt(variance + self.eps) * self.weight
+
+
+class StandaloneLayerNorm(nn.Module):
+    def __init__(self, size: int, bias: bool = False) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(size))
+        self.bias = nn.Parameter(torch.zeros(size)) if bias else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+def make_standalone_norm(norm_type: str, dim: int, bias: bool = False) -> nn.Module:
+    if norm_type == "rmsnorm":
+        return StandaloneRMSNorm(dim)
+    return StandaloneLayerNorm(dim, bias=bias)
+
+
+class StandaloneCausalSelfAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, kv_heads: int, context_length: int, dropout: float = 0.0, bias: bool = False, pos_enc: str = "rope") -> None:
+        super().__init__()
+        self.head_count = n_heads
+        self.kv_head_count = kv_heads or n_heads
+        self.embedding_size = d_model
+        self.head_size = d_model // n_heads
+        self.kv_embedding_size = self.kv_head_count * self.head_size
+        self.c_attn = nn.Linear(d_model, d_model + (2 * self.kv_embedding_size), bias=bias)
+        self.c_proj = nn.Linear(d_model, d_model, bias=bias)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.rotary = StandaloneRotaryEmbedding(self.head_size, context_length) if pos_enc == "rope" else None
+        self.register_buffer("mask", torch.tril(torch.ones(context_length, context_length, dtype=torch.bool)).view(1, 1, context_length, context_length))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, c = x.size()
+        qkv = self.c_attn(x)
+        q, k, v = qkv.split((self.embedding_size, self.kv_embedding_size, self.kv_embedding_size), dim=2)
+        q = q.view(b, t, self.head_count, self.head_size).transpose(1, 2)
+        k = k.view(b, t, self.kv_head_count, self.head_size).transpose(1, 2)
+        v = v.view(b, t, self.kv_head_count, self.head_size).transpose(1, 2)
+        if self.rotary is not None:
+            q, k = self.rotary(q, k)
+        if self.kv_head_count != self.head_count:
+            rep = self.head_count // self.kv_head_count
+            k = k[:, :, None, :, :].expand(b, self.kv_head_count, rep, t, self.head_size).reshape(b, self.head_count, t, self.head_size)
+            v = v[:, :, None, :, :].expand(b, self.kv_head_count, rep, t, self.head_size).reshape(b, self.head_count, t, self.head_size)
+
+        if hasattr(F, "scaled_dot_product_attention"):
+            q_sdpa = q.contiguous()
+            k_sdpa = k.contiguous()
+            v_sdpa = v.contiguous()
+            y = F.scaled_dot_product_attention(q_sdpa, k_sdpa, v_sdpa, is_causal=True, dropout_p=self.attn_dropout.p if self.training else 0.0)
+        else:
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_size))
+            att = att.masked_fill(self.mask[:, :, :t, :t] == 0, float("-inf"))
+            att = F.softmax(att, dim=-1)
+            y = self.attn_dropout(att) @ v
+
+        y = y.transpose(1, 2).contiguous().view(b, t, c)
+        return self.resid_dropout(self.c_proj(y))
+
+
+class StandaloneMLP(nn.Module):
+    def __init__(self, d_model: int, hidden_dim: int, mlp_type: str = "swiglu", dropout: float = 0.0, bias: bool = False) -> None:
+        super().__init__()
+        self.mlp_type = mlp_type
+        if mlp_type == "swiglu":
+            self.w1 = nn.Linear(d_model, hidden_dim, bias=bias)
+            self.w2 = nn.Linear(hidden_dim, d_model, bias=bias)
+            self.w3 = nn.Linear(d_model, hidden_dim, bias=bias)
+            self.dropout = nn.Dropout(dropout)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(d_model, hidden_dim, bias=bias),
+                nn.GELU(),
+                nn.Linear(hidden_dim, d_model, bias=bias),
+                nn.Dropout(dropout),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mlp_type == "swiglu":
+            return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        return self.net(x)
+
+
+class StandaloneBlock(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, kv_heads: int, hidden_dim: int, context_length: int, norm_type: str = "rmsnorm", mlp_type: str = "swiglu", dropout: float = 0.0, bias: bool = False, pos_enc: str = "rope") -> None:
+        super().__init__()
+        self.ln_1 = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.attn = StandaloneCausalSelfAttention(d_model, n_heads, kv_heads, context_length, dropout, bias, pos_enc)
+        self.ln_2 = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.mlp = StandaloneMLP(d_model, hidden_dim, mlp_type, dropout, bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class StandaloneMicroGPT(nn.Module):
+    """Zero-dependency PyTorch implementation of MicroGPT, 100% state-dict compatible with engine."""
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__()
+        vocab_size = int(config.get("vocab_size", 1000))
+        d_model = int(config.get("embedding_size", 128))
+        context_length = int(config.get("context_length", 256))
+        n_heads = int(config.get("head_count", 4))
+        kv_heads = int(config.get("kv_head_count") or n_heads)
+        n_layers = int(config.get("layer_count", 2))
+        hidden_dim = int(config.get("intermediate_size") or (d_model * 4))
+        norm_type = str(config.get("norm_type", "rmsnorm"))
+        mlp_type = str(config.get("mlp_type", "swiglu"))
+        dropout = float(config.get("dropout", 0.0))
+        bias = bool(config.get("bias", False))
+        pos_enc = str(config.get("position_encoding", "rope"))
+
+        self.context_length = context_length
+        self.vocab_size = vocab_size
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(context_length, d_model) if pos_enc == "learned" else None
+        self.drop = nn.Dropout(dropout)
+        self.blocks = nn.Sequential(*[
+            StandaloneBlock(d_model, n_heads, kv_heads, hidden_dim, context_length, norm_type, mlp_type, dropout, bias, pos_enc)
+            for _ in range(n_layers)
+        ])
+        self.ln_f = make_standalone_norm(norm_type, d_model, bias=bias)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.token_embedding.weight = self.lm_head.weight
+        self.gradient_checkpointing = False
+
+    def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
+        self.gradient_checkpointing = bool(enabled)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        b, t = idx.size()
+        if hasattr(self, "token_embedding") and hasattr(self.token_embedding, "num_embeddings"):
+            idx = torch.clamp(idx, 0, self.token_embedding.num_embeddings - 1)
+        x = self.token_embedding(idx)
+        if self.position_embedding is not None:
+            if t > self.context_length:
+                t = self.context_length
+                x = x[:, :t, :]
+            positions = torch.arange(0, t, dtype=torch.long, device=idx.device)
+            x = x + self.position_embedding(positions)
+        x = self.drop(x)
+        for block in self.blocks:
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+
 def build_model_from_config(
     model_config: dict[str, Any],
     device: str,
@@ -475,10 +709,11 @@ def build_model_from_config(
 ) -> nn.Module:
     """Instantiate a transformer model from configuration with detailed debug tracking.
 
-    Attempts import from `engine.model_transformer.TransformerModel` first.
-    Falls back to a standard PyTorch TransformerLM if engine is not installed.
+    Attempts import from `engine.model.MicroGPT` first.
+    Falls back to `StandaloneMicroGPT` (100% state-dict and architecture parity) if engine is not available.
     """
     log = logger or (lambda msg: print(f"[ModelBuilder] {msg}"))
+    ctx_len = int(model_config.get("context_length", 0) or 0)
     try:
         log(f"Importing engine components (ModelConfig, MicroGPT)...")
         from engine.config import ModelConfig
@@ -502,39 +737,12 @@ def build_model_from_config(
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
-        log(f"MicroGPT initialization failed ({exc}). Falling back to minimal TransformerLM. Traceback:\n{tb}")
-
-        # Fallback minimal transformer language model
-        vocab_size = int(model_config.get("vocab_size", 1000))
-        embed_dim = int(model_config.get("embedding_size", 128))
-        num_heads = int(model_config.get("head_count", 4))
-        num_layers = int(model_config.get("layer_count", 2))
-        dropout = float(model_config.get("dropout", 0.1))
-
-        class FallbackLM(nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.tok_embed = nn.Embedding(vocab_size, embed_dim)
-                encoder_layer = nn.TransformerEncoderLayer(
-                    d_model=embed_dim,
-                    nhead=num_heads,
-                    dim_feedforward=embed_dim * 4,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-                self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-                self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                b, s = x.shape
-                # Causal mask
-                mask = torch.triu(torch.full((s, s), float("-inf"), device=x.device), diagonal=1)
-                h = self.tok_embed(x)
-                out = self.transformer(h, mask=mask, is_causal=True)
-                return self.lm_head(out)
-
-        log(f"Constructing FallbackLM on {device}...")
-        return FallbackLM().to(device)
+        log(f"MicroGPT initialization failed ({exc}). Falling back to StandaloneMicroGPT parity model. Traceback:\n{tb}")
+        log(f"Constructing StandaloneMicroGPT on {device}...")
+        model = StandaloneMicroGPT(model_config).to(device)
+        if hasattr(model, "enable_gradient_checkpointing") and ctx_len >= 1024:
+            model.enable_gradient_checkpointing(True)
+        return model
 
 
 # -----------------------------------------------------------------------------
@@ -764,56 +972,7 @@ class ClusterWorker:
                     release_singleton_lock(f"wid_{self.worker_id}")
                     os._exit(0)
                 elif cmd == "RESTART":
-                    self.log("Received remote RESTART command. Respawning worker process...")
-                    self.bus.set_worker_command(self.worker_id, None)
-                    self._current_status = "RESTARTING"
-                    try:
-                        self.bus.heartbeat(self.worker_id, status="RESTARTING", current_job_id=None)
-                    except Exception:
-                        pass
-                    self._cleanup_child_worker_procs()
-                    from .cluster_worker import release_singleton_lock, get_device_tag, get_worker_respawn_cmd
-                    if not self.allow_shared_device:
-                        release_singleton_lock(get_device_tag(self.device_str))
-                    release_singleton_lock(f"wid_{self.worker_id}")
-
-                    # Attempt git pull to grab latest repository updates if running inside a git checkout
-                    try:
-                        repo_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
-                        if (repo_dir / ".git").exists():
-                            self.log("Pulling latest cluster repository changes before respawning...")
-                            subprocess.run(["git", "pull", "--ff-only"], cwd=str(repo_dir), timeout=15, capture_output=True)
-                    except Exception:
-                        pass
-
-                    cmd_args = get_worker_respawn_cmd(
-                        worker_id=self.worker_id,
-                        device_str=self.device_str,
-                        shared_dir=self.bus.shared_dir,
-                        allow_shared_device=self.allow_shared_device,
-                    )
-                    flags = 0
-                    if sys.platform == "win32":
-                        DETACHED_PROCESS = 0x00000008
-                        CREATE_NEW_PROCESS_GROUP = 0x00000200
-                        CREATE_NO_WINDOW = 0x08000000
-                        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-                    log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
-                    log_file = open(log_path, "a", encoding="utf-8")
-                    try:
-                        proc = subprocess.Popen(
-                            cmd_args,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                            creationflags=flags,
-                            close_fds=True,
-                        )
-                        self.log(f"Successfully respawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
-                    except Exception as exc:
-                        self.log(f"Failed to spawn new worker process: {exc}", level="ERROR")
-                    self._stop_event.set()
-                    time.sleep(0.3)
-                    os._exit(0)
+                    self._respawn_worker_process("remote RESTART command")
 
                 metrics = collect_system_metrics(self.device_str, getattr(self, "vram_gb", 0.0))
                 self.bus.heartbeat(
@@ -825,6 +984,62 @@ class ClusterWorker:
             except Exception:
                 pass
             self._stop_event.wait(self.heartbeat_interval)
+
+    def _respawn_worker_process(self, reason: str = "") -> None:
+        """Cleanly respawn this worker process and exit to recover from fatal driver/CUDA corruption."""
+        self.log(f"Respawning worker process for {self.worker_id} ({reason or 'restarting'})...")
+        try:
+            self.bus.set_worker_command(self.worker_id, None)
+        except Exception:
+            pass
+        self._current_status = "RESTARTING"
+        try:
+            self.bus.heartbeat(self.worker_id, status="RESTARTING", current_job_id=None)
+        except Exception:
+            pass
+        self._cleanup_child_worker_procs()
+        from .cluster_worker import release_singleton_lock, get_device_tag, get_worker_respawn_cmd
+        if not self.allow_shared_device:
+            release_singleton_lock(get_device_tag(self.device_str))
+        release_singleton_lock(f"wid_{self.worker_id}")
+
+        # Attempt git pull to grab latest repository updates if running inside a git checkout
+        try:
+            repo_dir = Path(__file__).resolve().parent.parent if "cluster" in str(Path(__file__).parent) else Path(__file__).resolve().parent
+            if (repo_dir / ".git").exists():
+                self.log("Pulling latest cluster repository changes before respawning...")
+                subprocess.run(["git", "pull", "--ff-only"], cwd=str(repo_dir), timeout=15, capture_output=True)
+        except Exception:
+            pass
+
+        cmd_args = get_worker_respawn_cmd(
+            worker_id=self.worker_id,
+            device_str=self.device_str,
+            shared_dir=self.bus.shared_dir,
+            allow_shared_device=self.allow_shared_device,
+        )
+        flags = 0
+        if sys.platform == "win32":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        log_path = Path(tempfile.gettempdir()) / f"cluster_worker_{self.worker_id}.log"
+        log_file = open(log_path, "a", encoding="utf-8")
+        try:
+            proc = subprocess.Popen(
+                cmd_args,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                creationflags=flags,
+                close_fds=True,
+            )
+            self.log(f"Successfully respawned new worker process (PID: {proc.pid}). Exiting current process (PID: {os.getpid()}).")
+        except Exception as exc:
+            self.log(f"Failed to spawn new worker process: {exc}", level="ERROR")
+        self._stop_event.set()
+        time.sleep(0.3)
+        os._exit(0)
 
     def _cleanup_child_worker_procs(self) -> None:
         """Clean up and terminate auxiliary child worker processes."""
@@ -1028,7 +1243,19 @@ class ClusterWorker:
         precision = str(training_cfg.get("precision", "fp16")).lower()
         use_amp = bool(training_cfg.get("use_amp", True))
         amp_enabled = is_cuda and use_amp and (precision in ("fp16", "bf16"))
-        amp_dtype = torch.bfloat16 if (precision == "bf16" and torch.cuda.is_bf16_supported()) else torch.float16
+
+        if amp_enabled and precision == "bf16":
+            if is_hardware_bf16_supported(self.device_str):
+                amp_dtype = torch.bfloat16
+            else:
+                self.log(
+                    f"Notice: Compute device '{self.device_str}' ({getattr(self, 'gpu_name', 'GPU')}) lacks native hardware Bfloat16 tensor cores (sm_80+ required). "
+                    "Safely falling back to FP16 with GradScaler for numerical stability and kernel safety.",
+                    level="INFO",
+                )
+                amp_dtype = torch.float16
+        else:
+            amp_dtype = torch.float16
 
         scaler = None
         if amp_enabled and amp_dtype == torch.float16:
@@ -1098,10 +1325,10 @@ class ClusterWorker:
             x, y = batch
             batch_sz = x.size(0)
             tokens_processed += int(x.numel())
-            if hasattr(model, "token_embedding") and hasattr(model.token_embedding, "num_embeddings"):
-                n_emb = model.token_embedding.num_embeddings
+            n_emb = get_model_vocab_size(model)
+            if n_emb is not None and n_emb > 0:
                 x = torch.clamp(x, 0, n_emb - 1)
-                y = torch.clamp(y, 0, n_emb - 1)
+                y = torch.where(y == -100, y, torch.clamp(y, 0, n_emb - 1))
 
             micro_bs = max(1, min(batch_sz, safe_micro_bs))
             num_micros = math.ceil(batch_sz / micro_bs)
@@ -1111,10 +1338,16 @@ class ClusterWorker:
             for m_idx in range(0, batch_sz, micro_bs):
                 x_m = x[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
                 y_m = y[m_idx : m_idx + micro_bs].to(self.device_str, non_blocking=True)
+                if n_emb is not None and n_emb > 0:
+                    x_m = torch.clamp(x_m, 0, n_emb - 1)
 
                 with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=amp_enabled):
                     logits = model(x_m)
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y_m.view(-1))
+                    if torch.isnan(logits).any() or torch.isinf(logits).any():
+                        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
+                    num_classes = logits.size(-1)
+                    y_m_safe = torch.where(y_m == -100, y_m, torch.clamp(y_m, 0, num_classes - 1))
+                    loss = F.cross_entropy(logits.view(-1, num_classes), y_m_safe.view(-1), ignore_index=-100)
                     scaled_loss = loss / effective_accum
 
                 if scaler is not None:
@@ -1273,46 +1506,64 @@ class ClusterWorker:
                 token_array = np.load(local_dataset_path, mmap_mode="r")
                 vocab_size = int(model_config.get("vocab_size", 0) or 0)
 
-                if vocab_size <= 0:
-                    detected_vocab = 0
-                    for sdir in [Path(dataset_path).parent, self.bus.shared_dir]:
-                        summary_file = sdir / "dataset_summary.json"
-                        if summary_file.exists():
-                            try:
-                                import json
-                                meta = json.loads(summary_file.read_text(encoding="utf-8"))
-                                detected_vocab = int(meta.get("tokenizer_vocab_size", 0) or 0)
-                                if detected_vocab > 0:
-                                    break
-                            except Exception:
-                                pass
-                        tok_file = sdir / "tokenizer.json"
-                        if tok_file.exists() and detected_vocab <= 0:
-                            try:
-                                import json
-                                tok_data = json.loads(tok_file.read_text(encoding="utf-8"))
-                                vocab_dict = tok_data.get("model", {}).get("vocab", {})
-                                if vocab_dict:
-                                    detected_vocab = len(vocab_dict)
-                                    break
-                            except Exception:
-                                pass
-
-                    max_token_id = 0
-                    if detected_vocab <= 0:
+                # 1. Inspect metadata files if present on shared storage or dataset dir
+                detected_vocab = 0
+                for sdir in [Path(dataset_path).parent, self.bus.shared_dir]:
+                    summary_file = sdir / "dataset_summary.json"
+                    if summary_file.exists():
                         try:
-                            sample = token_array[:50000]
-                            max_token_id = int(np.max(sample)) if len(sample) > 0 else 0
+                            import json
+                            meta = json.loads(summary_file.read_text(encoding="utf-8"))
+                            detected_vocab = int(meta.get("tokenizer_vocab_size", 0) or 0)
+                            if detected_vocab > 0:
+                                break
                         except Exception:
-                            max_token_id = 0
+                            pass
+                    tok_file = sdir / "tokenizer.json"
+                    if tok_file.exists() and detected_vocab <= 0:
+                        try:
+                            import json
+                            tok_data = json.loads(tok_file.read_text(encoding="utf-8"))
+                            vocab_dict = tok_data.get("model", {}).get("vocab", {})
+                            if vocab_dict:
+                                detected_vocab = len(vocab_dict)
+                                break
+                        except Exception:
+                            pass
 
-                    min_safe_vocab = 256
-                    if max_token_id > 0:
-                        min_safe_vocab = ((max_token_id + 1 + 255) // 256) * 256
-                        if 31000 <= max_token_id < 32000:
-                            min_safe_vocab = max(min_safe_vocab, 32000)
+                # 2. Inspect dataset tokens for true maximum token ID
+                max_token_id = 0
+                try:
+                    arr_len = len(token_array)
+                    if arr_len <= 10_000_000:
+                        max_token_id = int(np.max(token_array))
+                    else:
+                        slices = [
+                            token_array[:200000],
+                            token_array[arr_len // 4 : (arr_len // 4) + 200000],
+                            token_array[arr_len // 2 : (arr_len // 2) + 200000],
+                            token_array[(3 * arr_len) // 4 : ((3 * arr_len) // 4) + 200000],
+                            token_array[-200000:],
+                        ]
+                        max_token_id = max(int(np.max(s)) for s in slices if len(s) > 0)
+                except Exception:
+                    max_token_id = 0
 
-                    vocab_size = max(detected_vocab, min_safe_vocab, 256)
+                # 3. Determine safe aligned vocab_size
+                min_safe_vocab = 256
+                if max_token_id > 0:
+                    min_safe_vocab = ((max_token_id + 1 + 255) // 256) * 256
+                    if 31000 <= max_token_id < 32000:
+                        min_safe_vocab = max(min_safe_vocab, 32000)
+
+                target_vocab = max(vocab_size, detected_vocab, min_safe_vocab, 256)
+                if vocab_size < target_vocab:
+                    self.log(
+                        f"Model vocab_size ({vocab_size}) is smaller than required ({target_vocab}, detected: {detected_vocab}, max token: {max_token_id}). "
+                        f"Auto-adjusting vocab_size to {target_vocab}.",
+                        level="WARNING",
+                    )
+                    vocab_size = target_vocab
                     model_config["vocab_size"] = vocab_size
 
                 dataset = ShardedTokenDataset(
@@ -1512,6 +1763,21 @@ class ClusterWorker:
                     tb = traceback.format_exc()
                     self.log(f"Training round {current_round} crashed:\n{tb}", level="ERROR")
                     self._current_status = "ERROR"
+                    try:
+                        self.bus.heartbeat(self.worker_id, status="ERROR", current_job_id=job_id)
+                    except Exception:
+                        pass
+
+                    # Check for fatal CUDA context corruption that poisons the host process
+                    err_lower = (str(exc) + " " + tb).lower()
+                    if any(s in err_lower for s in ("cuda error", "device-side assert", "illegal memory access", "out of memory")):
+                        if self.device_str.startswith("cuda"):
+                            self.log(
+                                "Fatal CUDA context corruption / error detected. Host process cannot reliably recover in-place. "
+                                "Respawning fresh worker process with clean GPU context...",
+                                level="WARNING",
+                            )
+                            self._respawn_worker_process(reason=f"CUDA corruption recovery: {exc}")
                     return False
 
                 # Atomically deposit local worker weights
@@ -1876,6 +2142,14 @@ class ClusterWorker:
                 _ = (test_t + 1.0).sum().item()
                 del test_t
             except Exception as exc:
+                err_msg = str(exc)
+                if any(s in err_msg.lower() for s in ("cuda error", "device-side assert", "illegal memory access")):
+                    self.log(
+                        f"CUDA device '{self.device_str}' kernel execution test failed due to corrupted CUDA context ({exc}). "
+                        "Respawning fresh worker process to self-heal...",
+                        level="WARNING",
+                    )
+                    self._respawn_worker_process(reason=f"Kernel test failure: {exc}")
                 return False, f"CUDA device '{self.device_str}' failed kernel execution test: {exc}"
 
         # 4. Check precision compatibility (e.g. bfloat16 hardware support)
@@ -1888,8 +2162,10 @@ class ClusterWorker:
         prec = str(tcfg.get("precision", "float32")).lower()
         if prec in {"bfloat16", "bf16"}:
             if self.device_str.startswith("cuda"):
-                if not (hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()):
-                    return False, f"Device '{self.device_str}' does not natively support bfloat16 precision."
+                if not is_hardware_bf16_supported(self.device_str):
+                    # Device does not have native hardware BF16 tensor cores (e.g. Turing sm_75, Pascal sm_61)
+                    # Worker will automatically adapt to FP16 with GradScaler during training for safety
+                    pass
 
         # 5. Check dataset accessibility
         dataset_path = job.get("dataset_path", "")
